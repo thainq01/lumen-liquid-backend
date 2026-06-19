@@ -165,6 +165,16 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 			e.state.Remove(a.Key)
 			return false
 		}
+		if isPriceMismatch(sim.Error) {
+			// PriceMismatch (#21) means the on-chain Reflector oracle hasn't
+			// crossed the TP/SL threshold yet — the contract gate is working as
+			// designed. Don't count this as a real error or burn retries; just
+			// drop from the pending queue. The detector re-enqueues on the next
+			// Binance tick once the condition is actually met.
+			logger.Debug().Msg("executor: price mismatch (oracle not confirmed), dropping for re-detect")
+			e.dropItem(item, "price_mismatch")
+			return false
+		}
 		if item.Retries >= e.maxRetries {
 			logger.Warn().Str("sim_error", sim.Error).Int("retries", item.Retries).Msg("executor: max retries, dropping")
 			e.dropItem(item, "max_retries_sim")
@@ -348,4 +358,10 @@ func isTradeNotFound(simErr string) bool {
 	// Contract returns TradeNotFound as Error(Contract, #17) — match either the
 	// name or the numeric code, since the sim error string may carry either form.
 	return simErr != "" && (strings.Contains(simErr, "TradeNotFound") || strings.Contains(simErr, "#17"))
+}
+
+func isPriceMismatch(simErr string) bool {
+	// Contract returns PriceMismatch as Error(Contract, #21) when the on-chain
+	// Reflector price hasn't crossed the threshold yet. Match name or code.
+	return simErr != "" && (strings.Contains(simErr, "PriceMismatch") || strings.Contains(simErr, "#21"))
 }

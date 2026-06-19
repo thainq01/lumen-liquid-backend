@@ -3,7 +3,6 @@ package keeper
 import (
 	"context"
 	"encoding/json"
-	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -168,15 +167,32 @@ func (b *BinanceClient) handleMessage(data []byte) {
 	}
 }
 
-// parsePriceToScale converts a decimal string price (e.g. "62738.10") to
-// PRICE_SCALE (1e10) as *big.Int.
+// parsePriceToScale converts a decimal string price (e.g. "62738.10") to the
+// Reflector oracle scale (1e14, decimals=14) as *big.Int. This must match the
+// scale of the on-chain tp/sl/liq prices, which the contract compares directly
+// against the Reflector price inside execute_tp_sl / liquidate_trade.
+//
+// Parsing is done on the decimal string directly (not via float64) to keep
+// full precision at 1e14 magnitude, where float64 mantissa would round the
+// low-order digits.
 func parsePriceToScale(s string) *big.Int {
-	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || f <= 0 {
+	const decimals = 14
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return nil
 	}
-	scaled := f * 1e10
-	return new(big.Int).SetInt64(int64(math.Round(scaled)))
+
+	intPart, fracPart, _ := strings.Cut(s, ".")
+	if len(fracPart) > decimals {
+		fracPart = fracPart[:decimals] // truncate excess precision
+	}
+	digits := intPart + fracPart + strings.Repeat("0", decimals-len(fracPart))
+
+	v, ok := new(big.Int).SetString(digits, 10)
+	if !ok || v.Sign() <= 0 {
+		return nil
+	}
+	return v
 }
 
 func nextBackoff(current time.Duration) time.Duration {

@@ -155,24 +155,24 @@ services:
       indexer-replay:
         condition: service_completed_successfully
     restart: *restart
+    labels:
+      ofelia.enabled: "true"
+      # Daily indexer-replay at 04:00
+      ofelia.job-exec.replay.schedule: "0 4 * * *"
+      ofelia.job-exec.replay.command: "indexer-replay"
+      # Daily pair-indexer at 04:30
+      ofelia.job-exec.pair-indexer.schedule: "30 4 * * *"
+      ofelia.job-exec.pair-indexer.command: "pair-indexer"
 
   # ── Scheduler ─────────────────────────────────────────────
 
   ofelia:
     image: mcuadros/ofelia:latest
+    command: daemon --docker
+    <<: *internal
     restart: *restart
     depends_on:
       sleeper:
         condition: service_started
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    labels:
-      # Daily indexer-replay at 04:00
-      ofelia.job-exec.replay.schedule: "0 4 * * *"
-      ofelia.job-exec.replay.container: "lumenliquid-sleeper"
-      ofelia.job-exec.replay.command: "indexer-replay"
-
-      # Daily pair-indexer at 04:30
-      ofelia.job-exec.pair-indexer.schedule: "30 4 * * *"
-      ofelia.job-exec.pair-indexer.container: "lumenliquid-sleeper"
-      ofelia.job-exec.pair-indexer.command: "pair-indexer"

@@ -135,7 +135,7 @@ func TestDetect_ZeroTpSlIgnored(t *testing.T) {
 
 func TestParsePriceToScale(t *testing.T) {
 	got := parsePriceToScale("62738.10")
-	want := bi("627381000000000")
+	want := bi("6273810000000000000") // 62,738.10 × 1e14
 	if got == nil || got.Cmp(want) != 0 {
 		t.Fatalf("parsePriceToScale: got %v want %v", got, want)
 	}
