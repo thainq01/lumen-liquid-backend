@@ -1,0 +1,10 @@
+BEGIN;
+DROP TABLE IF EXISTS indexer_cursor;
+DROP TABLE IF EXISTS pair_oi;
+DROP TABLE IF EXISTS vault_positions;
+DROP TABLE IF EXISTS limit_order_history;
+DROP TABLE IF EXISTS limit_orders;
+DROP TABLE IF EXISTS trade_history;
+DROP TABLE IF EXISTS trades;
+DROP TABLE IF EXISTS trade_events;
+COMMIT;

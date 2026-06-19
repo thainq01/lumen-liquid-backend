@@ -1,0 +1,8 @@
+.env
+.env.local
+*.log
+/bin/
+/tmp/
+.DS_Store
+/coverage.out
+/sqlc/
