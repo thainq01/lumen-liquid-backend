@@ -1,13 +1,17 @@
 # ============================================================
-# LumenLiquid Backend — Production Stack
+# LumenLiquid Backend — Production Stack (Dokploy / shared Traefik)
 # ============================================================
 # Usage:
 #   docker compose -f docker-compose.prod.yml up -d
 #   (or make prod-up)
 #
-# Before first run, copy .env.prod.example → .env and fill in
-# the values. DATABASE_URL and REDIS_URL use service names
-# (postgres / redis) rather than localhost.
+# This server already runs Dokploy's Traefik (owns :80/:443) with a
+# `letsencrypt` certresolver and watches the external `dokploy-network`.
+# We do NOT run our own Traefik — the `api` service joins dokploy-network
+# and is routed via Traefik labels (same pattern as the Jira stack).
+#
+# Before first run, copy .env.prod.example → .env and fill in values.
+# DATABASE_URL / REDIS_URL use service names (postgres / redis).
 #
 # Startup order:
 #   postgres(healthy) ─┬─ migrate ── indexer-replay ─┬─ indexer
@@ -30,14 +34,13 @@ networks:
   internal:
     driver: bridge
     internal: false      # allows outbound traffic (Soroban RPC, Binance WS)
-  web:
-    driver: bridge
+  dokploy-network:
+    external: true       # Dokploy's Traefik watches this network
 
 # ── Volumes ────────────────────────────────────────────────
 volumes:
   pgdata:
   redisdata:
-  acme-data:
 
 # ── Services ───────────────────────────────────────────────
 services:
@@ -108,20 +111,26 @@ services:
     <<: [*internal, *env]
     networks:
       - internal
-      - web
+      - dokploy-network
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     labels:
-      # Traefik
-      - traefik.enable=true
-      - traefik.http.routers.api.rule=Host(`${DOMAIN?DOMAIN is required}`)
-      - traefik.http.routers.api.entrypoints=websecure
-      - traefik.http.routers.api.tls=true
-      - traefik.http.routers.api.tls.certresolver=letsencrypt
-      - traefik.http.services.api.loadbalancer.server.port=8080
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.services.lumenliquid-api.loadbalancer.server.port=8080"
+      # HTTPS router
+      - "traefik.http.routers.lumenliquid-api.rule=Host(`${DOMAIN?DOMAIN is required}`)"
+      - "traefik.http.routers.lumenliquid-api.entrypoints=websecure"
+      - "traefik.http.routers.lumenliquid-api.tls.certresolver=letsencrypt"
+      # HTTP → HTTPS redirect
+      - "traefik.http.routers.lumenliquid-api-http.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.lumenliquid-api-http.entrypoints=web"
+      - "traefik.http.routers.lumenliquid-api-http.middlewares=lumenliquid-api-redirect@docker"
+      - "traefik.http.middlewares.lumenliquid-api-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.lumenliquid-api-redirect.redirectscheme.permanent=true"
     restart: *restart
 
   keeper:
@@ -167,38 +176,3 @@ services:
       ofelia.job-exec.pair-indexer.schedule: "30 4 * * *"
       ofelia.job-exec.pair-indexer.container: "lumenliquid-sleeper"
       ofelia.job-exec.pair-indexer.command: "pair-indexer"
-
-  # ── Reverse proxy ─────────────────────────────────────────
-
-  traefik:
-    image: traefik:v3
-    restart: *restart
-    ports:
-      - "80:80"
-      - "443:443"
-    networks:
-      - web
-    volumes:
-      # Docker provider: watch for new containers with traefik.enable=true
-      - /var/run/docker.sock:/var/run/docker.sock
-      # ACME cert storage
-      - acme-data:/acme
-    command:
-      # Global
-      - "--log.level=INFO"
-      # Entrypoints
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      # HTTP → HTTPS redirect
-      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
-      # ACME / Let's Encrypt
-      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL?ACME_EMAIL is required}"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-      # Docker provider (only containers on the web network)
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=web"
-      # Don't watch the entire daemon — just the web-net containers
-      - "--providers.docker.watch=true"
