@@ -1,0 +1,204 @@
+# ============================================================
+# LumenLiquid Backend — Production Stack
+# ============================================================
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   (or make prod-up)
+#
+# Before first run, copy .env.prod.example → .env and fill in
+# the values. DATABASE_URL and REDIS_URL use service names
+# (postgres / redis) rather than localhost.
+#
+# Startup order:
+#   postgres(healthy) ─┬─ migrate ── indexer-replay ─┬─ indexer
+#   redis(healthy) ────┘                              ├─ api
+#                                                     ├─ keeper
+#                                                     └─ sleeper ── ofelia
+# ============================================================
+
+x-image: &app-image ghcr.io/thainq01/lumen-liquid-backend:${IMAGE_TAG:-latest}
+x-restart: &restart unless-stopped
+x-internal: &internal
+  networks:
+    - internal
+x-env: &env
+  env_file:
+    - .env
+
+# ── Networks ───────────────────────────────────────────────
+networks:
+  internal:
+    driver: bridge
+    internal: false      # allows outbound traffic (Soroban RPC, Binance WS)
+  web:
+    driver: bridge
+
+# ── Volumes ────────────────────────────────────────────────
+volumes:
+  pgdata:
+  redisdata:
+  acme-data:
+
+# ── Services ───────────────────────────────────────────────
+services:
+
+  # ── Infrastructure ────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    <<: *internal
+    environment:
+      POSTGRES_USER: lumen
+      POSTGRES_PASSWORD: lumen
+      POSTGRES_DB: lumenliquid
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lumen"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: *restart
+
+  redis:
+    image: redis:7-alpine
+    <<: *internal
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: *restart
+
+  # ── Boot sequence ─────────────────────────────────────────
+
+  migrate:
+    image: *app-image
+    command: ["migrate", "up"]
+    <<: [*internal, *env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  indexer-replay:
+    image: *app-image
+    command: ["indexer-replay"]
+    <<: [*internal, *env]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # ── Long-running services ─────────────────────────────────
+
+  indexer:
+    image: *app-image
+    command: ["indexer"]
+    <<: [*internal, *env]
+    depends_on:
+      indexer-replay:
+        condition: service_completed_successfully
+
+  api:
+    image: *app-image
+    command: ["api"]
+    <<: [*internal, *env]
+    networks:
+      - internal
+      - web
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    labels:
+      # Traefik
+      - traefik.enable=true
+      - traefik.http.routers.api.rule=Host(`${DOMAIN?DOMAIN is required}`)
+      - traefik.http.routers.api.entrypoints=websecure
+      - traefik.http.routers.api.tls=true
+      - traefik.http.routers.api.tls.certresolver=letsencrypt
+      - traefik.http.services.api.loadbalancer.server.port=8080
+    restart: *restart
+
+  keeper:
+    image: *app-image
+    command: ["keeper"]
+    <<: [*internal, *env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: *restart
+
+  # ── Cron-worker container (stays alive so Ofelia can exec) ──
+
+  sleeper:
+    image: *app-image
+    command: ["sleep", "infinity"]
+    <<: [*internal, *env]
+    container_name: lumenliquid-sleeper
+    depends_on:
+      indexer-replay:
+        condition: service_completed_successfully
+    restart: *restart
+
+  # ── Scheduler ─────────────────────────────────────────────
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    restart: *restart
+    depends_on:
+      sleeper:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      # Daily indexer-replay at 04:00
+      ofelia.job-exec.replay.schedule: "0 4 * * *"
+      ofelia.job-exec.replay.container: "lumenliquid-sleeper"
+      ofelia.job-exec.replay.command: "indexer-replay"
+
+      # Daily pair-indexer at 04:30
+      ofelia.job-exec.pair-indexer.schedule: "30 4 * * *"
+      ofelia.job-exec.pair-indexer.container: "lumenliquid-sleeper"
+      ofelia.job-exec.pair-indexer.command: "pair-indexer"
+
+  # ── Reverse proxy ─────────────────────────────────────────
+
+  traefik:
+    image: traefik:v3
+    restart: *restart
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - web
+    volumes:
+      # Docker provider: watch for new containers with traefik.enable=true
+      - /var/run/docker.sock:/var/run/docker.sock
+      # ACME cert storage
+      - acme-data:/acme
+    command:
+      # Global
+      - "--log.level=INFO"
+      # Entrypoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # HTTP → HTTPS redirect
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # ACME / Let's Encrypt
+      - "--certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL?ACME_EMAIL is required}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      # Docker provider (only containers on the web network)
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=web"
+      # Don't watch the entire daemon — just the web-net containers
+      - "--providers.docker.watch=true"

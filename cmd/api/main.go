@@ -83,6 +83,15 @@ func main() {
 	// WebSocket: Real-time updates for ALL trades
 	r.Get("/ws/v1/trades", handleAllTradesWebSocket(hub, logger))
 
+	// WebSocket: Real-time price feed from Binance
+	r.Get("/ws/v1/prices", handlePricesWebSocket(hub, logger))
+
+	// Start Binance price feed → broadcasts to "prices" channel
+	if cfg.BinanceWSURL != "" && cfg.PairSymbolMap != "" {
+		priceFeed := wsgateway.NewPriceFeed(hub, cfg.BinanceWSURL, cfg.PairSymbolMap, logger)
+		go priceFeed.Run(ctx)
+	}
+
 	// Start server
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
@@ -317,6 +326,27 @@ func handleAllTradesWebSocket(hub *wsgateway.Hub, logger zerolog.Logger) http.Ha
 		hub.Subscribe(client, "trades:all")
 
 		// Start pumps
+		go client.WritePump(r.Context())
+		client.ReadPump(r.Context())
+	}
+}
+
+func handlePricesWebSocket(hub *wsgateway.Hub, logger zerolog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			OriginPatterns: []string{"*"},
+		})
+		if err != nil {
+			logger.Warn().Err(err).Msg("websocket accept error")
+			return
+		}
+
+		remoteAddr := r.RemoteAddr
+		client := wsgateway.NewClient(hub, conn, remoteAddr, logger)
+
+		hub.Register(client)
+		hub.Subscribe(client, "prices")
+
 		go client.WritePump(r.Context())
 		client.ReadPump(r.Context())
 	}

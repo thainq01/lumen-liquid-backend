@@ -30,28 +30,28 @@ const (
 
 // Trade mirrors PM types.rs::Trade — 9 fields in declared order.
 type Trade struct {
-	PairIndex        uint32   `json:"pair_index"`
-	IsLong           bool     `json:"is_long"`
-	Leverage         uint32   `json:"leverage"`
-	OpenPrice        *big.Int `json:"open_price"`
-	Collateral       *big.Int `json:"collateral"`
-	AccRolloverOpen  *big.Int `json:"acc_rollover_open"`
-	AccFundingOpen   *big.Int `json:"acc_funding_open"`
-	TpPrice          *big.Int `json:"tp_price"`
-	SlPrice          *big.Int `json:"sl_price"`
+	PairIndex       uint32   `json:"pair_index"`
+	IsLong          bool     `json:"is_long"`
+	Leverage        uint32   `json:"leverage"`
+	OpenPrice       *big.Int `json:"open_price"`
+	Collateral      *big.Int `json:"collateral"`
+	AccRolloverOpen *big.Int `json:"acc_rollover_open"`
+	AccFundingOpen  *big.Int `json:"acc_funding_open"`
+	TpPrice         *big.Int `json:"tp_price"`
+	SlPrice         *big.Int `json:"sl_price"`
 }
 
 // Event is the decoded form of a Soroban contract event. RawData carries the
 // full ScVal-converted payload as JSON-friendly types so unknown topics still
 // land in trade_events for forensic review.
 type Event struct {
-	Source       Source   `json:"source"`
-	Topic        string   `json:"topic"`
-	ContractID   string   `json:"contract_id"`
-	TxHash       string   `json:"tx_hash"`
-	EventIndex   uint32   `json:"event_index"`
-	Ledger       uint64   `json:"ledger"`
-	OccurredAt   string   `json:"occurred_at"`
+	Source     Source `json:"source"`
+	Topic      string `json:"topic"`
+	ContractID string `json:"contract_id"`
+	TxHash     string `json:"tx_hash"`
+	EventIndex uint32 `json:"event_index"`
+	Ledger     uint64 `json:"ledger"`
+	OccurredAt string `json:"occurred_at"`
 
 	// Routing keys decoded from topic[1..], populated when present.
 	Trader     string `json:"trader,omitempty"`
@@ -61,20 +61,24 @@ type Event struct {
 	GroupIndex *int32 `json:"group_index,omitempty"`
 
 	// Decoded payload (typed for known topics, raw for unknown).
-	Trade        *Trade   `json:"trade,omitempty"`
-	Assets       *big.Int `json:"assets,omitempty"`
-	Shares       *big.Int `json:"shares,omitempty"`
-	NetPnl       *big.Int `json:"net_pnl,omitempty"`
-	GrossPayout  *big.Int `json:"gross_payout,omitempty"`
-	Amount       *big.Int `json:"amount,omitempty"`
-	RatePer      *big.Int `json:"rate_p,omitempty"`
-	FeePer       *big.Int `json:"fee_p,omitempty"`
-	Symbol       string   `json:"symbol,omitempty"`
+	Trade       *Trade   `json:"trade,omitempty"`
+	Assets      *big.Int `json:"assets,omitempty"`
+	Shares      *big.Int `json:"shares,omitempty"`
+	NetPnl      *big.Int `json:"net_pnl,omitempty"`
+	GrossPayout *big.Int `json:"gross_payout,omitempty"`
+	Amount      *big.Int `json:"amount,omitempty"`
+	RatePer     *big.Int `json:"rate_p,omitempty"`
+	FeePer      *big.Int `json:"fee_p,omitempty"`
+	Symbol      string   `json:"symbol,omitempty"`
 
 	// PM close/open financial fields (enriched events).
-	OpenFee      *big.Int `json:"open_fee,omitempty"`
-	CloseFee     *big.Int `json:"close_fee,omitempty"`
-	ClosePrice   *big.Int `json:"close_price,omitempty"`
+	OpenFee    *big.Int `json:"open_fee,omitempty"`
+	CloseFee   *big.Int `json:"close_fee,omitempty"`
+	ClosePrice *big.Int `json:"close_price,omitempty"`
+
+	// New tp/sl values carried by the updated_tp_sl event.
+	TpPrice *big.Int `json:"tp_price,omitempty"`
+	SlPrice *big.Int `json:"sl_price,omitempty"`
 
 	RawTopics []any `json:"raw_topics"`
 	RawData   any   `json:"raw_data"`
@@ -194,10 +198,16 @@ func Decode(r soroban.EventResult, pmID, vaultID, registryID string) (Event, err
 // ── PM ─────────────────────────────────────────────────────────────────────
 
 func decodePM(e *Event, topic string, topics []any, data any, raw xdr.ScVal) {
-	// PM events: topics = (Symbol, trader Address)
+	// PM events: topics = (Symbol, trader Address [, pair_index])
 	if len(topics) > 1 {
 		if s, ok := topics[1].(string); ok {
 			e.Trader = s
+		}
+	}
+	// Pair_index is now topics[2] on close/liq/tp_sl_executed/updated_tp_sl
+	if len(topics) > 2 {
+		if i, ok := toInt32(topics[2]); ok {
+			e.PairIndex = ptrI32(i)
 		}
 	}
 	switch topic {
@@ -229,7 +239,21 @@ func decodePM(e *Event, topic string, topics []any, data any, raw xdr.ScVal) {
 			// Backwards-compat: old events carried only trade_index.
 			e.TradeIndex = ptrI32(i)
 		}
-	case "executed", "updated_tp_sl":
+	case "updated_tp_sl":
+		// data = (trade_index:u32, tp_price:i128, sl_price:i128)
+		if v, ok := data.([]any); ok && len(v) >= 1 {
+			if i, ok := toInt32(v[0]); ok {
+				e.TradeIndex = ptrI32(i)
+			}
+			if len(v) >= 3 {
+				e.TpPrice = toBig(v[1])
+				e.SlPrice = toBig(v[2])
+			}
+		} else if i, ok := toInt32(data); ok {
+			// Backwards-compat: old events carried only trade_index.
+			e.TradeIndex = ptrI32(i)
+		}
+	case "executed":
 		if i, ok := toInt32(data); ok {
 			e.TradeIndex = ptrI32(i)
 		}

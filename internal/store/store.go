@@ -130,12 +130,17 @@ func applyPM(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error
 		return err
 
 	case "updated_tp_sl":
-		// The contract event currently only carries trade_index; tp/sl prices
-		// are stored on-chain but not embedded in the event. The keeper
-		// (Phase 2) reconciles by reading the trade via simulateTransaction.
-		// For now we touch updated_at by updating opened_tx column? No — leave
-		// projection untouched. The audit row in trade_events is enough.
-		return nil
+		if e.TradeIndex == nil || e.TpPrice == nil || e.SlPrice == nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+				UPDATE trades
+				   SET tp_price = $1, sl_price = $2
+				 WHERE trader = $3 AND pair_index = $4 AND trade_index = $5`,
+			bigStr(e.TpPrice), bigStr(e.SlPrice),
+			e.Trader, deref(e.PairIndex), *e.TradeIndex,
+		)
+		return err
 
 	case "closed":
 		return closeTrade(ctx, tx, e, "manual", at)
@@ -196,23 +201,41 @@ func closeTrade(ctx context.Context, tx pgx.Tx, e events.Event, reason string, a
 	return err
 }
 
-// closeTradeUnknownReason is fired by tp_sl_executed; we pick tp vs sl by
-// comparing the (last known) prices on the row before deletion. If both are
-// set, the keeper-side trigger model decides which crossed; for the indexer
-// projection we just record `tp` if tp_price > 0 else `sl`. The audit log
-// holds the exact event for forensic disambiguation.
+// closeTradeUnknownReason is fired by tp_sl_executed; we pick "tp" vs "sl" by
+// comparing the close_price against the row's tp_price and sl_price. When the
+// event carries a close_price we use it directly; falling back to the old
+// "tp_price nonzero → tp" heuristic for legacy events without close_price.
 func closeTradeUnknownReason(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error {
 	if e.TradeIndex == nil {
 		return nil
 	}
 	row := tx.QueryRow(ctx, `
-		SELECT tp_price, sl_price FROM trades
+		SELECT is_long, tp_price, sl_price FROM trades
 		 WHERE trader = $1 AND pair_index = $2 AND trade_index = $3`,
 		e.Trader, deref(e.PairIndex), *e.TradeIndex)
-	var tp, sl float64 // numeric → float is fine for "is it nonzero"
-	_ = row.Scan(&tp, &sl)
-	reason := "tp"
-	if tp == 0 {
+	var isLong, hasRow bool
+	var tp, sl float64
+	if err := row.Scan(&isLong, &tp, &sl); err == nil {
+		hasRow = true
+	}
+
+	reason := "tp" // default
+	if hasRow && e.ClosePrice != nil {
+		cp, _ := new(big.Float).SetString(e.ClosePrice.String())
+		if isLong {
+			if sl > 0 && cp.Cmp(new(big.Float).SetFloat64(sl)) <= 0 {
+				reason = "sl"
+			} else if tp > 0 && cp.Cmp(new(big.Float).SetFloat64(tp)) >= 0 {
+				reason = "tp"
+			}
+		} else {
+			if sl > 0 && cp.Cmp(new(big.Float).SetFloat64(sl)) >= 0 {
+				reason = "sl"
+			} else if tp > 0 && cp.Cmp(new(big.Float).SetFloat64(tp)) <= 0 {
+				reason = "tp"
+			}
+		}
+	} else if tp == 0 {
 		reason = "sl"
 	}
 	return closeTrade(ctx, tx, e, reason, at)

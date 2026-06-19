@@ -8,14 +8,18 @@ DATABASE_URL ?= postgres://lumen:lumen@localhost:5432/lumenliquid?sslmode=disabl
 MIGRATE := docker run --rm -v $(PWD)/migrations:/migrations --network host migrate/migrate \
 		   -path=/migrations -database "$(DATABASE_URL)"
 
+INFRA := docker compose -f docker-compose.infra.yml
+PROD  := docker compose -f docker-compose.prod.yml
+
 .PHONY: up down migrate-up migrate-down migrate-new tidy fmt vet test \
-        run-indexer run-indexer-replay psql redis-cli
+        run-indexer run-indexer-replay run-keeper psql redis-cli \
+        prod-up prod-down prod-pull prod-logs
 
 up:
-	docker compose up -d
+	$(INFRA) up -d
 
 down:
-	docker compose down
+	$(INFRA) down
 
 # ── migrations ────────────────────────────────────────────
 migrate-up:
@@ -49,9 +53,28 @@ run-indexer:
 run-indexer-replay:
 	go run ./cmd/indexer-replay
 
+run-keeper:
+	go run ./cmd/keeper
+
 # ── shells ────────────────────────────────────────────────
 psql:
-	docker compose exec postgres psql -U lumen -d lumenliquid
+	$(INFRA) exec postgres psql -U lumen -d lumenliquid
 
 redis-cli:
-	docker compose exec redis redis-cli
+	$(INFRA) exec redis redis-cli
+
+# ── prod ──────────────────────────────────────────────────
+prod-up:
+	$(PROD) up -d
+
+prod-down:
+	$(PROD) down
+
+prod-pull:
+	$(PROD) pull
+
+prod-logs:
+	$(PROD) logs -f
+
+prod-ps:
+	$(PROD) ps

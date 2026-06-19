@@ -47,6 +47,23 @@
       "program": "${workspaceFolder}/cmd/api",
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "keeper",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/keeper",
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "showLog": true
+    }
+  ],
+  "compounds": [
+    {
+      "name": "indexer + api, ws + keeper",
+      "configurations": ["indexer", "api, ws", "keeper"],
+      "stopAll": true
     }
   ]
 }

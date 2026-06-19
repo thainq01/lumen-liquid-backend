@@ -46,11 +46,11 @@ type CachedPair struct {
 // re-publishes on ledger re-scan) does not duplicate state and does not
 // re-notify subscribers.
 type TradeCache struct {
-	mu      sync.RWMutex
-	trades  map[string][]CachedTrade // trader -> open trades
-	pairs   map[int]CachedPair       // pair_index -> config
-	pool    *pgxpool.Pool
-	rdb     *redis.Client
+	mu       sync.RWMutex
+	trades   map[string][]CachedTrade // trader -> open trades
+	pairs    map[int]CachedPair       // pair_index -> config
+	pool     *pgxpool.Pool
+	rdb      *redis.Client
 	onChange func(trader string)
 }
 
@@ -170,6 +170,19 @@ func (c *TradeCache) applyEvent(eventJSON []byte) {
 		if removed := removeTrade(c.trades, e.Trader, pairIdx, int(*e.TradeIndex)); removed {
 			changed = true
 		}
+	case "updated_tp_sl":
+		if e.TradeIndex == nil || e.TpPrice == nil || e.SlPrice == nil {
+			c.mu.Unlock()
+			return
+		}
+		pairIdx := 0
+		if e.PairIndex != nil {
+			pairIdx = int(*e.PairIndex)
+		}
+		if updated := updateTradeTpSl(c.trades, e.Trader, pairIdx, int(*e.TradeIndex),
+			bigStr(e.TpPrice), bigStr(e.SlPrice)); updated {
+			changed = true
+		}
 	}
 	c.mu.Unlock()
 
@@ -261,6 +274,21 @@ func removeTrade(trades map[string][]CachedTrade, trader string, pairIdx, tradeI
 	for i, t := range list {
 		if t.PairIndex == pairIdx && t.TradeIndex == tradeIdx {
 			trades[trader] = append(list[:i], list[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// updateTradeTpSl updates tp_price and sl_price on a cached trade (matched by
+// trader + pair_index + trade_index). Returns true if the trade was found and
+// updated.
+func updateTradeTpSl(trades map[string][]CachedTrade, trader string, pairIdx, tradeIdx int, tp, sl string) bool {
+	list := trades[trader]
+	for i, t := range list {
+		if t.PairIndex == pairIdx && t.TradeIndex == tradeIdx {
+			list[i].TpPrice = tp
+			list[i].SlPrice = sl
 			return true
 		}
 	}

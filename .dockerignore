@@ -1,0 +1,16 @@
+.env
+.env.*
+.git
+.gitignore
+*.md
+*.log
+api
+indexer
+pair-indexer
+target/
+.vscode/
+.claude/
+.gitkeep
+docs/
+scripts/
+.cache/
