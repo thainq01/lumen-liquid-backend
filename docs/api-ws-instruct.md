@@ -117,7 +117,7 @@ GET /api/v1/trading-history/{trader}
       "realized_pnl": "150.25",
       "open_fee": "5000000",
       "close_fee": "5000000",
-      "close_reason": "tp_sl_executed",
+      "close_reason": "tp",
       "opened_at": "2026-06-18T10:00:00Z",
       "opened_tx": "abc123...",
       "closed_at": "2026-06-19T12:00:00Z",
@@ -143,7 +143,7 @@ GET /api/v1/trading-history/{trader}
 | `realized_pnl` | string | Realized PnL (raw integer string) |
 | `open_fee` | string | Fee paid to open (raw integer string) |
 | `close_fee` | string | Fee paid to close (raw integer string) |
-| `close_reason` | string | Reason for close: `closed`, `liq`, `tp_sl_executed` |
+| `close_reason` | string | Reason for close: `manual`, `tp`, `sl`, `liquidation` |
 | `opened_at` | string (RFC3339) | Position open timestamp |
 | `opened_tx` | string | Stellar transaction hash of open |
 | `closed_at` | string (RFC3339) | Position close timestamp |

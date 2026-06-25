@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,14 +18,29 @@ import (
 )
 
 type Client struct {
-	url   string
+	urls  []string
 	http  *http.Client
 	idSeq atomic.Uint64
 }
 
-func New(url string) *Client {
+// New builds a client. First url is primary; any extras are failover backups
+// tried in order when the primary returns a network error or 5xx/429 response.
+// Empty url strings are ignored.
+func New(url string, backups ...string) *Client {
+	urls := make([]string, 0, 1+len(backups))
+	if url != "" {
+		urls = append(urls, url)
+	}
+	for _, b := range backups {
+		if b != "" {
+			urls = append(urls, b)
+		}
+	}
+	if len(urls) == 0 {
+		urls = []string{""} // preserve prior behavior: fail loudly on use
+	}
 	return &Client{
-		url:  url,
+		urls: urls,
 		http: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -77,7 +93,39 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
+
+	var lastErr error
+	for i, url := range c.urls {
+		err := c.callOne(ctx, url, body, out)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		// Only fail over on transport errors or retryable HTTP statuses (5xx/429).
+		// RPC-level errors (*RPCError) are valid responses — return immediately.
+		if !shouldFailover(err) || i == len(c.urls)-1 {
+			return err
+		}
+		// else: try next backup endpoint
+	}
+	return lastErr
+}
+
+// shouldFailover reports whether err warrants trying the next endpoint.
+func shouldFailover(err error) bool {
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return he.StatusCode == http.StatusTooManyRequests || he.StatusCode >= 500
+	}
+	var re *RPCError
+	if errors.As(err, &re) {
+		return false // valid RPC error response — backups won't differ
+	}
+	return true // transport/timeout/decode error — try next
+}
+
+func (c *Client) callOne(ctx context.Context, url string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

@@ -19,8 +19,14 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────
+# Auto-detect project dir: works whether this script sits in the project
+# root or in a scripts/ subdirectory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -f "$SCRIPT_DIR/docker-compose.prod.yml" ]]; then
+  PROJECT_DIR="$SCRIPT_DIR"
+else
+  PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 COMPOSE_FILE="$PROJECT_DIR/docker-compose.prod.yml"
 COMPOSE=(docker compose -f "$COMPOSE_FILE")
 

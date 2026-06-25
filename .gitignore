@@ -6,3 +6,6 @@
 .DS_Store
 /coverage.out
 /sqlc/
+
+CLAUDE.md
+.mcp.json
