@@ -150,11 +150,39 @@ func applyPM(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error
 		return closeTrade(ctx, tx, e, "liquidation", at)
 
 	case "placed":
-		// MVP: indexer doesn't have raw data for the limit-order fields in
-		// the event payload (contract emits only limit_index). Keep the
-		// `trade_events` row for replay; populate `limit_orders` via Phase 2
-		// reconciler. (See implement_plan.md.)
-		return nil
+		if e.Limit == nil || e.LimitIndex == nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO limit_orders (
+			  trader, pair_index, limit_index, is_long, leverage,
+			  collateral, limit_price, tp_price, sl_price, placed_at, placed_tx
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			ON CONFLICT (trader, pair_index, limit_index) DO UPDATE
+			  SET is_long     = EXCLUDED.is_long,
+			      leverage    = EXCLUDED.leverage,
+			      collateral  = EXCLUDED.collateral,
+			      limit_price = EXCLUDED.limit_price,
+			      tp_price    = EXCLUDED.tp_price,
+			      sl_price    = EXCLUDED.sl_price`,
+			e.Trader, e.Limit.PairIndex, *e.LimitIndex,
+			e.Limit.IsLong, e.Limit.Leverage,
+			bigStr(e.Limit.Collateral), bigStr(e.Limit.LimitPrice),
+			bigStr(e.Limit.TpPrice), bigStr(e.Limit.SlPrice), at, e.TxHash,
+		)
+		return err
+	case "updated_limit":
+		if e.LimitIndex == nil || e.LimitPrice == nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+			UPDATE limit_orders
+			   SET limit_price = $1, tp_price = $2, sl_price = $3
+			 WHERE trader = $4 AND pair_index = $5 AND limit_index = $6`,
+			bigStr(e.LimitPrice), bigStr(e.TpPrice), bigStr(e.SlPrice),
+			e.Trader, deref(e.PairIndex), *e.LimitIndex,
+		)
+		return err
 	case "executed":
 		return resolveLimit(ctx, tx, e, "executed", at)
 	case "canceled":
@@ -165,15 +193,16 @@ func applyPM(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error
 
 // closeTrade moves a row from trades → trade_history with the given reason.
 // Financial fields (close_price, close_fee, realized_pnl) come from the
-// enriched close event. realized_pnl is the trader's PnL = -net_pnl_for_vault
-// (the event carries the vault's perspective).
+// enriched close event. net_pnl is already the trader's PnL (negative = loss),
+// matching the on-chain return_collateral_with_pnl(eff_collat, net_pnl) call,
+// so it is stored verbatim.
 func closeTrade(ctx context.Context, tx pgx.Tx, e events.Event, reason string, at time.Time) error {
 	if e.TradeIndex == nil {
 		return nil
 	}
 	var realizedPnl any
 	if e.NetPnl != nil {
-		realizedPnl = new(big.Int).Neg(e.NetPnl).String()
+		realizedPnl = e.NetPnl.String()
 	}
 	_, err := tx.Exec(ctx, `
 		WITH del AS (

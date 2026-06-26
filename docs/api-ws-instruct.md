@@ -173,7 +173,7 @@ const ws = new WebSocket("wss://services.lumenliquid.xyz/ws/v1/trades");
 /ws/v1/trades/{trader}
 ```
 
-Real-time updates for a single trader's positions. On connect, a full snapshot of the trader's open trades is sent immediately. Thereafter, any state change (opened, closed, liquidated, TP/SL executed, TP/SL updated) sends a fresh full snapshot.
+Real-time updates for a single trader's positions and open limit orders. On connect, a full snapshot is sent immediately. Thereafter, any state change (opened, closed, liquidated, TP/SL executed, TP/SL updated, limit placed/executed/canceled/updated) sends a fresh full snapshot.
 
 **Server → Client (full snapshot):**
 ```json
@@ -194,6 +194,20 @@ Real-time updates for a single trader's positions. On connect, a full snapshot o
       "opened_at": "2026-06-19T10:00:00Z"
     }
   ],
+  "limits": [
+    {
+      "trader": "GA...",
+      "pair_index": 0,
+      "limit_index": 0,
+      "is_long": true,
+      "leverage": 10,
+      "collateral": "1000000000",
+      "limit_price": "60000.00",
+      "tp_price": "70000.00",
+      "sl_price": "58000.00",
+      "placed_at": "2026-06-19T09:30:00Z"
+    }
+  ],
   "pairs": [
     {
       "pair_index": 0,
@@ -207,6 +221,25 @@ Real-time updates for a single trader's positions. On connect, a full snapshot o
 }
 ```
 
+`limits` lists the trader's open (unfilled) limit orders. When a limit fills, it
+leaves `limits` and a new position appears in `trades` (the keeper's
+`execute_limit_order` emits both an `opened` and an `executed` event). `collateral`
+is the raw pre-fee amount; the post-fee `collateral` shows on the resulting trade.
+
+**Limit order fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pair_index` | int | On-chain pair index |
+| `limit_index` | int | Limit order index within the pair |
+| `is_long` | bool | `true` for long, `false` for short |
+| `leverage` | int | Leverage to apply on fill |
+| `collateral` | string | Raw collateral, pre-fee (raw integer string) |
+| `limit_price` | string | Trigger price; long fills at/below, short fills at/above |
+| `tp_price` | string | Take-profit for the resulting trade (or "0") |
+| `sl_price` | string | Stop-loss for the resulting trade (or "0") |
+| `placed_at` | string (RFC3339) | When the order was placed |
+
 ---
 
 ### 2. Global Trade Feed
@@ -215,7 +248,7 @@ Real-time updates for a single trader's positions. On connect, a full snapshot o
 /ws/v1/trades
 ```
 
-Subscribe to all trade activity across every trader. Same snapshot format as per-trader feed, containing all open trades across all traders.
+Subscribe to all trade activity across every trader. Same snapshot format as per-trader feed, containing all open trades and open limit orders across all traders.
 
 **Server → Client:**
 
@@ -223,6 +256,7 @@ Subscribe to all trade activity across every trader. Same snapshot format as per
 {
   "type": "snapshot",
   "trades": [ /* every open trade across all traders */ ],
+  "limits": [ /* every open limit order across all traders */ ],
   "pairs": [ /* all configured pairs */ ]
 }
 ```

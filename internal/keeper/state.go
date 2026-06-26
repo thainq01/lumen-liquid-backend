@@ -26,15 +26,32 @@ type TradeEntry struct {
 	SlPrice  *big.Int
 }
 
+// LimitKey identifies an open limit order. TradeIndex field is reused as the
+// limit_index so the executor's pending map can hold both without collision
+// (disambiguated by PendingAction.Type).
+type LimitKey struct {
+	Trader     string
+	PairIndex  int
+	LimitIndex int
+}
+
+type LimitEntry struct {
+	Key        LimitKey
+	IsLong     bool
+	LimitPrice *big.Int
+}
+
 type TradeState struct {
 	mu     sync.RWMutex
 	trades map[TradeKey]*TradeEntry
+	limits map[LimitKey]*LimitEntry
 	logger zerolog.Logger
 }
 
 func NewTradeState(logger zerolog.Logger) *TradeState {
 	return &TradeState{
 		trades: make(map[TradeKey]*TradeEntry),
+		limits: make(map[LimitKey]*LimitEntry),
 		logger: logger,
 	}
 }
@@ -77,6 +94,42 @@ func (s *TradeState) LoadFromDB(ctx context.Context, pool *pgxpool.Pool) error {
 		n++
 	}
 	s.logger.Info().Int("count", n).Msg("state: loaded trades from DB")
+
+	if err := s.loadLimitsFromDB(ctx, pool); err != nil {
+		return err
+	}
+	return rows.Err()
+}
+
+func (s *TradeState) loadLimitsFromDB(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, `
+		SELECT trader, pair_index, limit_index, is_long, limit_price
+		FROM limit_orders`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var n int
+	for rows.Next() {
+		var trader string
+		var pairIdx, limitIdx int
+		var isLong bool
+		var limitPrice string
+		if err := rows.Scan(&trader, &pairIdx, &limitIdx, &isLong, &limitPrice); err != nil {
+			s.logger.Warn().Err(err).Msg("state: scan limit row")
+			continue
+		}
+		key := LimitKey{Trader: trader, PairIndex: pairIdx, LimitIndex: limitIdx}
+		entry := &LimitEntry{Key: key, IsLong: isLong}
+		entry.LimitPrice, _ = new(big.Int).SetString(limitPrice, 10)
+
+		s.mu.Lock()
+		s.limits[key] = entry
+		s.mu.Unlock()
+		n++
+	}
+	s.logger.Info().Int("count", n).Msg("state: loaded limit orders from DB")
 	return rows.Err()
 }
 
@@ -139,6 +192,51 @@ func (s *TradeState) Apply(e events.Event) {
 				Int("trade_idx", key.TradeIndex).Msg("state: updated tp/sl")
 		}
 		s.mu.Unlock()
+
+	case "placed":
+		if e.Limit == nil || e.LimitIndex == nil {
+			return
+		}
+		key := LimitKey{
+			Trader:     e.Trader,
+			PairIndex:  int(e.Limit.PairIndex),
+			LimitIndex: int(*e.LimitIndex),
+		}
+		entry := &LimitEntry{Key: key, IsLong: e.Limit.IsLong, LimitPrice: e.Limit.LimitPrice}
+		s.mu.Lock()
+		s.limits[key] = entry
+		s.mu.Unlock()
+		s.logger.Info().Str("trader", e.Trader).Int("pair", key.PairIndex).
+			Int("limit_idx", key.LimitIndex).Str("limit_price", bigStr(e.Limit.LimitPrice)).
+			Bool("is_long", e.Limit.IsLong).Msg("state: added limit order to watch")
+
+	case "executed", "canceled":
+		// executed also emits `opened`, handled above; here drop the limit order.
+		if e.LimitIndex == nil {
+			return
+		}
+		s.RemoveLimit(LimitKey{
+			Trader:     e.Trader,
+			PairIndex:  int(deref32(e.PairIndex)),
+			LimitIndex: int(*e.LimitIndex),
+		})
+
+	case "updated_limit":
+		if e.LimitIndex == nil {
+			return
+		}
+		s.mu.Lock()
+		key := LimitKey{
+			Trader:     e.Trader,
+			PairIndex:  int(deref32(e.PairIndex)),
+			LimitIndex: int(*e.LimitIndex),
+		}
+		if l, ok := s.limits[key]; ok && e.LimitPrice != nil {
+			l.LimitPrice = e.LimitPrice
+			s.logger.Debug().Str("trader", e.Trader).Int("pair", key.PairIndex).
+				Int("limit_idx", key.LimitIndex).Msg("state: updated limit price")
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -165,6 +263,31 @@ func (s *TradeState) GetTradesForPair(pairIndex int) []TradeEntry {
 		}
 	}
 	return out
+}
+
+func (s *TradeState) GetLimitsForPair(pairIndex int) []LimitEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []LimitEntry
+	for _, l := range s.limits {
+		if l.Key.PairIndex == pairIndex {
+			out = append(out, *l)
+		}
+	}
+	return out
+}
+
+func (s *TradeState) RemoveLimit(key LimitKey) {
+	s.mu.Lock()
+	delete(s.limits, key)
+	s.mu.Unlock()
+}
+
+func bigStr(b *big.Int) string {
+	if b == nil {
+		return "0"
+	}
+	return b.String()
 }
 
 func (s *TradeState) Count() int {

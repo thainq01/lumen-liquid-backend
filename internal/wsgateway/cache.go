@@ -40,6 +40,20 @@ type CachedPair struct {
 	Disabled      bool   `json:"disabled"`
 }
 
+// CachedLimit is a trader's open limit order, sent over WebSocket.
+type CachedLimit struct {
+	Trader     string `json:"trader"`
+	PairIndex  int    `json:"pair_index"`
+	LimitIndex int    `json:"limit_index"`
+	IsLong     bool   `json:"is_long"`
+	Leverage   int    `json:"leverage"`
+	Collateral string `json:"collateral"`
+	LimitPrice string `json:"limit_price"`
+	TpPrice    string `json:"tp_price"`
+	SlPrice    string `json:"sl_price"`
+	PlacedAt   string `json:"placed_at"`
+}
+
 // TradeCache holds open trades and pair configs in memory, updated in
 // real-time from indexer events via a persistent Redis subscription to
 // `events:global`. Updates are idempotent: a re-delivered event (the indexer
@@ -48,6 +62,7 @@ type CachedPair struct {
 type TradeCache struct {
 	mu       sync.RWMutex
 	trades   map[string][]CachedTrade // trader -> open trades
+	limits   map[string][]CachedLimit // trader -> open limit orders
 	pairs    map[int]CachedPair       // pair_index -> config
 	pool     *pgxpool.Pool
 	rdb      *redis.Client
@@ -57,6 +72,7 @@ type TradeCache struct {
 func NewTradeCache(pool *pgxpool.Pool, rdb *redis.Client) *TradeCache {
 	return &TradeCache{
 		trades: make(map[string][]CachedTrade),
+		limits: make(map[string][]CachedLimit),
 		pairs:  make(map[int]CachedPair),
 		pool:   pool,
 		rdb:    rdb,
@@ -108,6 +124,30 @@ func (c *TradeCache) LoadFromDB(ctx context.Context) error {
 		}
 		t.OpenedAt = openedAt.Format(time.RFC3339)
 		c.trades[t.Trader] = append(c.trades[t.Trader], t)
+	}
+	c.mu.Unlock()
+
+	limitRows, err := c.pool.Query(ctx, `
+		SELECT trader, pair_index, limit_index, is_long, leverage,
+		       collateral, limit_price, tp_price, sl_price, placed_at
+		FROM limit_orders`)
+	if err != nil {
+		return fmt.Errorf("load limit_orders: %w", err)
+	}
+	defer limitRows.Close()
+
+	c.mu.Lock()
+	c.limits = make(map[string][]CachedLimit)
+	for limitRows.Next() {
+		var l CachedLimit
+		var placedAt time.Time
+		if err := limitRows.Scan(&l.Trader, &l.PairIndex, &l.LimitIndex, &l.IsLong,
+			&l.Leverage, &l.Collateral, &l.LimitPrice, &l.TpPrice, &l.SlPrice,
+			&placedAt); err != nil {
+			continue
+		}
+		l.PlacedAt = placedAt.Format(time.RFC3339)
+		c.limits[l.Trader] = append(c.limits[l.Trader], l)
 	}
 	c.mu.Unlock()
 
@@ -183,6 +223,43 @@ func (c *TradeCache) applyEvent(eventJSON []byte) {
 			bigStr(e.TpPrice), bigStr(e.SlPrice)); updated {
 			changed = true
 		}
+
+	case "placed":
+		if e.Limit == nil || e.LimitIndex == nil {
+			c.mu.Unlock()
+			return
+		}
+		if !hasLimit(c.limits[e.Trader], int(e.Limit.PairIndex), int(*e.LimitIndex)) {
+			c.limits[e.Trader] = append(c.limits[e.Trader], buildLimit(&e))
+			changed = true
+		}
+	case "executed", "canceled":
+		// `executed` also emits `opened`, which adds the new trade above. Here we
+		// drop the consumed/canceled limit order from the trader's open limits.
+		if e.LimitIndex == nil {
+			c.mu.Unlock()
+			return
+		}
+		pairIdx := 0
+		if e.PairIndex != nil {
+			pairIdx = int(*e.PairIndex)
+		}
+		if removed := removeLimit(c.limits, e.Trader, pairIdx, int(*e.LimitIndex)); removed {
+			changed = true
+		}
+	case "updated_limit":
+		if e.LimitIndex == nil {
+			c.mu.Unlock()
+			return
+		}
+		pairIdx := 0
+		if e.PairIndex != nil {
+			pairIdx = int(*e.PairIndex)
+		}
+		if updated := updateLimit(c.limits, e.Trader, pairIdx, int(*e.LimitIndex),
+			bigStr(e.LimitPrice), bigStr(e.TpPrice), bigStr(e.SlPrice)); updated {
+			changed = true
+		}
 	}
 	c.mu.Unlock()
 
@@ -200,9 +277,16 @@ func (c *TradeCache) GetSnapshot(trader string) ([]byte, error) {
 	if trades == nil {
 		trades = []CachedTrade{}
 	}
+	limits := c.limits[trader]
+	if limits == nil {
+		limits = []CachedLimit{}
+	}
 	pairSet := make(map[int]bool)
 	for _, t := range trades {
 		pairSet[t.PairIndex] = true
+	}
+	for _, l := range limits {
+		pairSet[l.PairIndex] = true
 	}
 	pairs := []CachedPair{}
 	for idx, p := range c.pairs {
@@ -213,6 +297,7 @@ func (c *TradeCache) GetSnapshot(trader string) ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"type":   "snapshot",
 		"trades": trades,
+		"limits": limits,
 		"pairs":  pairs,
 	})
 }
@@ -227,6 +312,10 @@ func (c *TradeCache) GetAllSnapshot() ([]byte, error) {
 	for _, list := range c.trades {
 		all = append(all, list...)
 	}
+	allLimits := []CachedLimit{}
+	for _, list := range c.limits {
+		allLimits = append(allLimits, list...)
+	}
 	pairs := []CachedPair{}
 	for _, p := range c.pairs {
 		pairs = append(pairs, p)
@@ -234,6 +323,7 @@ func (c *TradeCache) GetAllSnapshot() ([]byte, error) {
 	return json.Marshal(map[string]any{
 		"type":   "snapshot",
 		"trades": all,
+		"limits": allLimits,
 		"pairs":  pairs,
 	})
 }
@@ -300,4 +390,52 @@ func bigStr(b *big.Int) string {
 		return "0"
 	}
 	return b.String()
+}
+
+func buildLimit(e *events.Event) CachedLimit {
+	return CachedLimit{
+		Trader:     e.Trader,
+		PairIndex:  int(e.Limit.PairIndex),
+		LimitIndex: int(*e.LimitIndex),
+		IsLong:     e.Limit.IsLong,
+		Leverage:   int(e.Limit.Leverage),
+		Collateral: bigStr(e.Limit.Collateral),
+		LimitPrice: bigStr(e.Limit.LimitPrice),
+		TpPrice:    bigStr(e.Limit.TpPrice),
+		SlPrice:    bigStr(e.Limit.SlPrice),
+		PlacedAt:   e.OccurredAt,
+	}
+}
+
+func hasLimit(limits []CachedLimit, pairIdx, limitIdx int) bool {
+	for _, l := range limits {
+		if l.PairIndex == pairIdx && l.LimitIndex == limitIdx {
+			return true
+		}
+	}
+	return false
+}
+
+func removeLimit(limits map[string][]CachedLimit, trader string, pairIdx, limitIdx int) bool {
+	list := limits[trader]
+	for i, l := range list {
+		if l.PairIndex == pairIdx && l.LimitIndex == limitIdx {
+			limits[trader] = append(list[:i], list[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func updateLimit(limits map[string][]CachedLimit, trader string, pairIdx, limitIdx int, limitPrice, tp, sl string) bool {
+	list := limits[trader]
+	for i, l := range list {
+		if l.PairIndex == pairIdx && l.LimitIndex == limitIdx {
+			list[i].LimitPrice = limitPrice
+			list[i].TpPrice = tp
+			list[i].SlPrice = sl
+			return true
+		}
+	}
+	return false
 }

@@ -41,6 +41,17 @@ type Trade struct {
 	SlPrice         *big.Int `json:"sl_price"`
 }
 
+// LimitOrder mirrors PM types.rs::LimitOrder — 7 fields in declared order.
+type LimitOrder struct {
+	PairIndex  uint32   `json:"pair_index"`
+	IsLong     bool     `json:"is_long"`
+	Collateral *big.Int `json:"collateral"`
+	Leverage   uint32   `json:"leverage"`
+	LimitPrice *big.Int `json:"limit_price"`
+	TpPrice    *big.Int `json:"tp_price"`
+	SlPrice    *big.Int `json:"sl_price"`
+}
+
 // Event is the decoded form of a Soroban contract event. RawData carries the
 // full ScVal-converted payload as JSON-friendly types so unknown topics still
 // land in trade_events for forensic review.
@@ -61,15 +72,16 @@ type Event struct {
 	GroupIndex *int32 `json:"group_index,omitempty"`
 
 	// Decoded payload (typed for known topics, raw for unknown).
-	Trade       *Trade   `json:"trade,omitempty"`
-	Assets      *big.Int `json:"assets,omitempty"`
-	Shares      *big.Int `json:"shares,omitempty"`
-	NetPnl      *big.Int `json:"net_pnl,omitempty"`
-	GrossPayout *big.Int `json:"gross_payout,omitempty"`
-	Amount      *big.Int `json:"amount,omitempty"`
-	RatePer     *big.Int `json:"rate_p,omitempty"`
-	FeePer      *big.Int `json:"fee_p,omitempty"`
-	Symbol      string   `json:"symbol,omitempty"`
+	Trade       *Trade      `json:"trade,omitempty"`
+	Limit       *LimitOrder `json:"limit,omitempty"`
+	Assets      *big.Int    `json:"assets,omitempty"`
+	Shares      *big.Int    `json:"shares,omitempty"`
+	NetPnl      *big.Int    `json:"net_pnl,omitempty"`
+	GrossPayout *big.Int    `json:"gross_payout,omitempty"`
+	Amount      *big.Int    `json:"amount,omitempty"`
+	RatePer     *big.Int    `json:"rate_p,omitempty"`
+	FeePer      *big.Int    `json:"fee_p,omitempty"`
+	Symbol      string      `json:"symbol,omitempty"`
 
 	// PM close/open financial fields (enriched events).
 	OpenFee    *big.Int `json:"open_fee,omitempty"`
@@ -79,6 +91,9 @@ type Event struct {
 	// New tp/sl values carried by the updated_tp_sl event.
 	TpPrice *big.Int `json:"tp_price,omitempty"`
 	SlPrice *big.Int `json:"sl_price,omitempty"`
+
+	// Limit price carried by updated_limit.
+	LimitPrice *big.Int `json:"limit_price,omitempty"`
 
 	RawTopics []any `json:"raw_topics"`
 	RawData   any   `json:"raw_data"`
@@ -254,10 +269,40 @@ func decodePM(e *Event, topic string, topics []any, data any, raw xdr.ScVal) {
 			e.TradeIndex = ptrI32(i)
 		}
 	case "executed":
+		// data = limit_index:u32 (the consumed limit order). The opened position
+		// arrives separately as an `opened` event emitted in the same call.
 		if i, ok := toInt32(data); ok {
-			e.TradeIndex = ptrI32(i)
+			e.LimitIndex = ptrI32(i)
 		}
-	case "placed", "canceled", "updated_limit":
+	case "placed":
+		// data = (limit_index:u32, LimitOrder-struct)
+		if v, ok := data.([]any); ok && len(v) >= 1 {
+			if i, ok := toInt32(v[0]); ok {
+				e.LimitIndex = ptrI32(i)
+			}
+			if len(v) >= 2 {
+				e.Limit = decodeLimitStruct(v[1])
+			}
+		} else if i, ok := toInt32(data); ok {
+			// Backwards-compat: old events carried only limit_index.
+			e.LimitIndex = ptrI32(i)
+		}
+	case "updated_limit":
+		// data = (limit_index:u32, limit_price:i128, tp_price:i128, sl_price:i128)
+		if v, ok := data.([]any); ok && len(v) >= 1 {
+			if i, ok := toInt32(v[0]); ok {
+				e.LimitIndex = ptrI32(i)
+			}
+			if len(v) >= 4 {
+				e.LimitPrice = toBig(v[1])
+				e.TpPrice = toBig(v[2])
+				e.SlPrice = toBig(v[3])
+			}
+		} else if i, ok := toInt32(data); ok {
+			// Backwards-compat: old events carried only limit_index.
+			e.LimitIndex = ptrI32(i)
+		}
+	case "canceled":
 		if i, ok := toInt32(data); ok {
 			e.LimitIndex = ptrI32(i)
 		}
@@ -369,6 +414,30 @@ func decodeTradeStruct(v any) *Trade {
 	t.TpPrice = toBig(m["tp_price"])
 	t.SlPrice = toBig(m["sl_price"])
 	return t
+}
+
+// decodeLimitStruct turns the ScVal-native form of `LimitOrder` into a typed
+// LimitOrder. Same ScMap-with-Symbol-keys shape as decodeTradeStruct.
+func decodeLimitStruct(v any) *LimitOrder {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	o := &LimitOrder{}
+	if x, ok := toInt32(m["pair_index"]); ok {
+		o.PairIndex = uint32(x)
+	}
+	if b, ok := m["is_long"].(bool); ok {
+		o.IsLong = b
+	}
+	if x, ok := toInt32(m["leverage"]); ok {
+		o.Leverage = uint32(x)
+	}
+	o.Collateral = toBig(m["collateral"])
+	o.LimitPrice = toBig(m["limit_price"])
+	o.TpPrice = toBig(m["tp_price"])
+	o.SlPrice = toBig(m["sl_price"])
+	return o
 }
 
 func toBig(v any) *big.Int {

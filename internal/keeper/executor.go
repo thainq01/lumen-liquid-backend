@@ -31,7 +31,18 @@ type Executor struct {
 	networkPassphrase string
 
 	mu      sync.Mutex
-	pending map[TradeKey]*pendingItem
+	pending map[string]*pendingItem
+}
+
+// pendKey uniquely identifies a queued action. Limit orders and trades can
+// share trader+pair+index 0, so the action type and limit index are mixed in
+// to avoid collisions in the pending map.
+func pendKey(a PendingAction) string {
+	idx := a.Key.TradeIndex
+	if a.Type == ActionLimit {
+		idx = a.LimitIndex
+	}
+	return fmt.Sprintf("%s|%s|%d|%d", a.Type, a.Key.Trader, a.Key.PairIndex, idx)
 }
 
 func NewExecutor(
@@ -51,7 +62,7 @@ func NewExecutor(
 		maxRetries:        maxRetries,
 		interval:          interval,
 		networkPassphrase: networkPassphrase,
-		pending:           make(map[TradeKey]*pendingItem),
+		pending:           make(map[string]*pendingItem),
 	}
 }
 
@@ -59,8 +70,9 @@ func (e *Executor) Enqueue(actions []PendingAction) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, a := range actions {
-		if _, exists := e.pending[a.Key]; !exists {
-			e.pending[a.Key] = &pendingItem{
+		k := pendKey(a)
+		if _, exists := e.pending[k]; !exists {
+			e.pending[k] = &pendingItem{
 				Action:    a,
 				EnqueueAt: time.Now(),
 			}
@@ -69,6 +81,7 @@ func (e *Executor) Enqueue(actions []PendingAction) {
 				Str("trader", a.Key.Trader).
 				Int("pair", a.Key.PairIndex).
 				Int("trade_idx", a.Key.TradeIndex).
+				Int("limit_idx", a.LimitIndex).
 				Msg("executor: enqueued")
 		}
 	}
@@ -76,7 +89,8 @@ func (e *Executor) Enqueue(actions []PendingAction) {
 
 func (e *Executor) Remove(key TradeKey) {
 	e.mu.Lock()
-	delete(e.pending, key)
+	delete(e.pending, pendKey(PendingAction{Type: ActionTpSl, Key: key}))
+	delete(e.pending, pendKey(PendingAction{Type: ActionLiquidate, Key: key}))
 	e.mu.Unlock()
 }
 
@@ -127,6 +141,7 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 		Str("trader", a.Key.Trader).
 		Int("pair", a.Key.PairIndex).
 		Int("trade_idx", a.Key.TradeIndex).
+		Int("limit_idx", a.LimitIndex).
 		Logger()
 
 	// Build unsigned tx for simulation
@@ -137,6 +152,9 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 		unsignedXDR, err = e.txb.BuildLiquidateTx(a.Key.Trader, a.Key.PairIndex, a.Key.TradeIndex)
 	case ActionTpSl:
 		unsignedXDR, err = e.txb.BuildExecuteTpSlTx(a.Key.Trader, a.Key.PairIndex, a.Key.TradeIndex)
+	case ActionLimit:
+		logger.Info().Msg("executor: limit order matched, attempting execute_limit_order")
+		unsignedXDR, err = e.txb.BuildExecuteLimitTx(a.Key.Trader, a.Key.PairIndex, a.LimitIndex)
 	}
 	if err != nil {
 		logger.Error().Err(err).Msg("executor: build tx failed")
@@ -157,12 +175,20 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 
 	if !sim.IsSuccess() {
 		item.Retries++
-		if isTradeNotFound(sim.Error) {
-			logger.Info().Msg("executor: trade not found (already closed), dropping")
-			e.dropItem(item, "trade_not_found")
+		if isTradeNotFound(sim.Error) || isLimitNotFound(sim.Error) {
+			logger.Info().Msg("executor: trade/limit not found (already resolved), dropping")
+			e.dropItem(item, "not_found")
 			// Remove from state too, else the detector re-enqueues it every tick
-			// until the indexer's close event arrives via Redis.
-			e.state.Remove(a.Key)
+			// until the indexer's resolving event arrives via Redis.
+			if a.Type == ActionLimit {
+				e.state.RemoveLimit(LimitKey{
+					Trader:     a.Key.Trader,
+					PairIndex:  a.Key.PairIndex,
+					LimitIndex: a.LimitIndex,
+				})
+			} else {
+				e.state.Remove(a.Key)
+			}
 			return false
 		}
 		if isPriceMismatch(sim.Error) {
@@ -204,7 +230,12 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 
 	switch sendRes.Status {
 	case "PENDING", "TRY_AGAIN_LATER":
-		logger.Info().Str("hash", sendRes.Hash).Str("status", sendRes.Status).Msg("executor: tx submitted")
+		if a.Type == ActionLimit {
+			logger.Info().Str("hash", sendRes.Hash).Str("status", sendRes.Status).
+				Msg("executor: limit order execution submitted — position will open")
+		} else {
+			logger.Info().Str("hash", sendRes.Hash).Str("status", sendRes.Status).Msg("executor: tx submitted")
+		}
 		e.dropItem(item, "submitted")
 		return true
 	case "DUPLICATE":
@@ -223,12 +254,13 @@ func (e *Executor) tryExecute(ctx context.Context, item *pendingItem) bool {
 
 func (e *Executor) dropItem(item *pendingItem, reason string) {
 	e.mu.Lock()
-	delete(e.pending, item.Action.Key)
+	delete(e.pending, pendKey(item.Action))
 	e.mu.Unlock()
 	e.logger.Debug().
 		Str("reason", reason).
 		Str("trader", item.Action.Key.Trader).
 		Int("trade_idx", item.Action.Key.TradeIndex).
+		Int("limit_idx", item.Action.LimitIndex).
 		Msg("executor: dropped from queue")
 }
 
@@ -364,4 +396,10 @@ func isPriceMismatch(simErr string) bool {
 	// Contract returns PriceMismatch as Error(Contract, #21) when the on-chain
 	// Reflector price hasn't crossed the threshold yet. Match name or code.
 	return simErr != "" && (strings.Contains(simErr, "PriceMismatch") || strings.Contains(simErr, "#21"))
+}
+
+func isLimitNotFound(simErr string) bool {
+	// Contract returns LimitNotFound as Error(Contract, #28) when the limit order
+	// was already executed or canceled. Match name or code.
+	return simErr != "" && (strings.Contains(simErr, "LimitNotFound") || strings.Contains(simErr, "#28"))
 }

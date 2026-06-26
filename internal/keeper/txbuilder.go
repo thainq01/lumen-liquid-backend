@@ -62,6 +62,18 @@ func (b *TxBuilder) BuildExecuteTpSlTx(trader string, pairIndex, tradeIndex int)
 	return b.buildInvokeTx("execute_tp_sl", args)
 }
 
+// BuildExecuteLimitTx targets execute_limit_order(trader, pair_index, limit_index).
+// The contract function takes no keeper address arg (no require_auth on keeper),
+// matching its Rust signature.
+func (b *TxBuilder) BuildExecuteLimitTx(trader string, pairIndex, limitIndex int) (string, error) {
+	args := []xdr.ScVal{
+		mustAccountAddressScVal(trader),
+		mustU32ScVal(uint32(pairIndex)),
+		mustU32ScVal(uint32(limitIndex)),
+	}
+	return b.buildInvokeTx("execute_limit_order", args)
+}
+
 func (b *TxBuilder) buildInvokeTx(funcName string, args []xdr.ScVal) (string, error) {
 	contractAddr, err := contractScAddress(b.pmContractID)
 	if err != nil {

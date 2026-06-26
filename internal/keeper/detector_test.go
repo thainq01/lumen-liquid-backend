@@ -20,6 +20,67 @@ func newTestState(entries ...*TradeEntry) *TradeState {
 	return s
 }
 
+func newTestStateWithLimits(limits ...*LimitEntry) *TradeState {
+	s := NewTradeState(zerolog.Nop())
+	for _, l := range limits {
+		s.limits[l.Key] = l
+	}
+	return s
+}
+
+func TestDetect_LongLimitFill(t *testing.T) {
+	// Long limit fills when price drops to/below limit_price.
+	limit := &LimitEntry{
+		Key:        LimitKey{Trader: "L1", PairIndex: 0, LimitIndex: 0},
+		IsLong:     true,
+		LimitPrice: bi("600000000000000"), // 60,000 @ 1e10
+	}
+	state := newTestStateWithLimits(limit)
+
+	// Above limit → no fill.
+	if got := Detect(0, bi("610000000000000"), state); len(got) != 0 {
+		t.Fatalf("expected no action above limit, got %d", len(got))
+	}
+	// At/below limit → ActionLimit carrying the limit index.
+	got := Detect(0, bi("600000000000000"), state)
+	if len(got) != 1 || got[0].Type != ActionLimit {
+		t.Fatalf("expected limit fill, got %+v", got)
+	}
+	if got[0].LimitIndex != 0 || got[0].Key.Trader != "L1" || got[0].Key.PairIndex != 0 {
+		t.Fatalf("limit action carried wrong key: %+v", got[0])
+	}
+}
+
+func TestDetect_ShortLimitFill(t *testing.T) {
+	// Short limit fills when price rises to/above limit_price.
+	limit := &LimitEntry{
+		Key:        LimitKey{Trader: "L2", PairIndex: 1, LimitIndex: 3},
+		IsLong:     false,
+		LimitPrice: bi("700000000000000"),
+	}
+	state := newTestStateWithLimits(limit)
+
+	if got := Detect(1, bi("690000000000000"), state); len(got) != 0 {
+		t.Fatalf("expected no action below limit for short, got %d", len(got))
+	}
+	got := Detect(1, bi("700000000000001"), state)
+	if len(got) != 1 || got[0].Type != ActionLimit || got[0].LimitIndex != 3 {
+		t.Fatalf("expected short limit fill at idx 3, got %+v", got)
+	}
+}
+
+func TestDetect_ZeroLimitPriceIgnored(t *testing.T) {
+	limit := &LimitEntry{
+		Key:        LimitKey{Trader: "L3", PairIndex: 0, LimitIndex: 0},
+		IsLong:     true,
+		LimitPrice: big.NewInt(0),
+	}
+	state := newTestStateWithLimits(limit)
+	if got := Detect(0, bi("1"), state); len(got) != 0 {
+		t.Fatalf("expected no action for zero limit price, got %d", len(got))
+	}
+}
+
 func TestDetect_LongLiquidation(t *testing.T) {
 	// Long liquidates when price <= liq_price.
 	entry := &TradeEntry{
