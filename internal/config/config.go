@@ -21,6 +21,7 @@ type Config struct {
 	IndexerStartLedger   uint32        `mapstructure:"indexer_start_ledger"`
 	LogLevel             string        `mapstructure:"log_level"`
 	HTTPAddr             string        `mapstructure:"http_addr"`
+	CORSAllowedOrigins   string        `mapstructure:"cors_allowed_origins"`
 	StellarSourceAccount string        `mapstructure:"stellar_source_account"`
 
 	// Keeper
@@ -45,6 +46,7 @@ func Load() (*Config, error) {
 	v.SetDefault("indexer_start_ledger", 0)
 	v.SetDefault("log_level", "info")
 	v.SetDefault("http_addr", ":8080")
+	v.SetDefault("cors_allowed_origins", "*")
 
 	v.SetDefault("keeper_poll_interval", 3*time.Second)
 	v.SetDefault("keeper_max_retries", 20)
@@ -60,7 +62,7 @@ func Load() (*Config, error) {
 		"pm_contract_id", "vault_contract_id", "registry_contract_id", "oracle_contract_id",
 		"database_url", "redis_url",
 		"indexer_poll_interval", "indexer_start_ledger",
-		"log_level", "http_addr", "stellar_source_account",
+		"log_level", "http_addr", "stellar_source_account", "cors_allowed_origins",
 		"keeper_secret", "keeper_poll_interval", "keeper_max_retries",
 		"binance_ws_url", "pair_symbol_map",
 	} {

@@ -98,8 +98,7 @@ func main() {
 	}
 }
 
-func collectContractIDs(cfg *config.Config) []string {
-	var ids []string
+func collectContractIDs(cfg *config.Config) []string {	var ids []string
 	for _, id := range []string{cfg.PMContractID, cfg.VaultContractID, cfg.RegistryContractID} {
 		id = strings.TrimSpace(id)
 		if id != "" {
@@ -125,6 +124,17 @@ func decideStartCursor(ctx context.Context, repo *store.Repo, rpc *soroban.Clien
 		return 0, "", fmt.Errorf("get latest ledger: %w", err)
 	}
 	return latest.Sequence, "", nil
+}
+
+// isLedgerRangeError reports whether err is the RPC -32600 "startLedger must be
+// within the ledger range" rejection — i.e. our cursor fell below the RPC's
+// retention window and we must re-clamp to the oldest available ledger.
+func isLedgerRangeError(err error) bool {
+	var re *soroban.RPCError
+	if !errors.As(err, &re) {
+		return false
+	}
+	return re.Code == -32600 && strings.Contains(re.Message, "must be within the ledger range")
 }
 
 func pollOnce(
@@ -153,7 +163,30 @@ func pollOnce(
 
 	resp, err := rpc.GetEvents(ctx, params)
 	if err != nil {
-		return err
+		// Self-heal: cursor/startLedger fell below RPC retention window.
+		// Clamp to oldest available ledger, drop stale cursor, retry once.
+		if isLedgerRangeError(err) {
+			h, herr := rpc.GetHealth(ctx)
+			if herr != nil {
+				return fmt.Errorf("get health after range error: %w (orig: %v)", herr, err)
+			}
+			logger.Warn().
+				Uint32("clamped_to", h.OldestLedger).
+				Uint32("oldest", h.OldestLedger).
+				Uint32("latest", h.LatestLedger).
+				Msg("cursor below RPC retention window — clamping startLedger to oldest")
+			*startLedger = h.OldestLedger
+			*cursor = ""
+			if werr := repo.WriteCursor(ctx, uint64(*startLedger), ""); werr != nil {
+				return fmt.Errorf("write clamped cursor: %w", werr)
+			}
+			params.Pagination.Cursor = ""
+			params.StartLedger = *startLedger
+			resp, err = rpc.GetEvents(ctx, params)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if len(resp.Events) == 0 {
 		return nil

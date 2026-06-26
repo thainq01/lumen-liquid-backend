@@ -18,6 +18,23 @@ func (c *Client) GetLatestLedger(ctx context.Context) (*GetLatestLedgerResp, err
 	return &out, nil
 }
 
+// ── getHealth ──────────────────────────────────────────────
+
+type GetHealthResp struct {
+	Status                string `json:"status"`
+	LatestLedger          uint32 `json:"latestLedger"`
+	OldestLedger          uint32 `json:"oldestLedger"`
+	LedgerRetentionWindow uint32 `json:"ledgerRetentionWindow"`
+}
+
+func (c *Client) GetHealth(ctx context.Context) (*GetHealthResp, error) {
+	var out GetHealthResp
+	if err := c.Call(ctx, "getHealth", struct{}{}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // ── getEvents ──────────────────────────────────────────────
 
 type EventFilterType string

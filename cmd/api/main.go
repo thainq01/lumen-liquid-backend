@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -65,6 +67,22 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+
+	// CORS: comma-separated origins from CORS_ALLOWED_ORIGINS. Default "*" = all.
+	origins := strings.Split(cfg.CORSAllowedOrigins, ",")
+	for i := range origins {
+		origins[i] = strings.TrimSpace(origins[i])
+	}
+	allowAll := len(origins) == 1 && origins[0] == "*"
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins: origins,
+		AllowedMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"Accept", "Authorization", "Content-Type"},
+		// Credentials cannot be combined with wildcard "*" per CORS spec —
+		// browsers reject Access-Control-Allow-Origin:* with credentials.
+		AllowCredentials: !allowAll,
+		MaxAge:           300,
+	}))
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
