@@ -45,6 +45,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 WORKDIR /app
 
+# The `stellar` CLI (used by pair-indexer) needs a writable config/cache dir.
+# The runtime user (uid 10001) has no home dir, so point HOME at world-writable
+# /tmp — without this, stellar fails with "Permission denied (os error 13)".
+ENV HOME=/tmp XDG_CONFIG_HOME=/tmp/.config
+
 # Go binaries.
 COPY --from=build /out/ /usr/local/bin/
 
