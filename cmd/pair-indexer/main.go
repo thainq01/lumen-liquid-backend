@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
 
 	"github.com/lumenliquid/backend/internal/config"
 	"github.com/lumenliquid/backend/internal/db"
@@ -40,7 +44,7 @@ func main() {
 	logger.Info().Str("registry", cfg.RegistryContractID).Msg("pair-indexer starting")
 
 	// Fetch pairs_count
-	count, err := callContract(cfg, "pairs_count")
+	count, err := callContract(ctx, logger, cfg, "pairs_count")
 	if err != nil {
 		logger.Fatal().Err(err).Msg("call pairs_count")
 	}
@@ -53,7 +57,15 @@ func main() {
 	// Fetch each pair and its group
 	groupsSeen := make(map[uint32]bool)
 	for i := uint32(0); i < pairsCount; i++ {
-		pairRaw, err := callContract(cfg, "get_pair", "--pair_index", fmt.Sprint(i))
+		// Pace invocations to avoid bursting the RPC rate limit.
+		select {
+		case <-ctx.Done():
+			logger.Info().Msg("shutdown")
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+
+		pairRaw, err := callContract(ctx, logger, cfg, "get_pair", "--pair_index", fmt.Sprint(i))
 		if err != nil {
 			logger.Error().Err(err).Uint32("pair", i).Msg("get_pair failed")
 			continue
@@ -66,7 +78,7 @@ func main() {
 		}
 
 		// Fetch depth
-		depthRaw, err := callContract(cfg, "get_depth", "--pair_index", fmt.Sprint(i))
+		depthRaw, err := callContract(ctx, logger, cfg, "get_depth", "--pair_index", fmt.Sprint(i))
 		if err != nil {
 			logger.Warn().Err(err).Uint32("pair", i).Msg("get_depth failed, using 0")
 		}
@@ -84,7 +96,7 @@ func main() {
 
 		// Fetch group if not seen
 		if !groupsSeen[pair.GroupIndex] {
-			groupRaw, err := callContract(cfg, "get_group", "--group_index", fmt.Sprint(pair.GroupIndex))
+			groupRaw, err := callContract(ctx, logger, cfg, "get_group", "--group_index", fmt.Sprint(pair.GroupIndex))
 			if err != nil {
 				logger.Error().Err(err).Uint32("group", pair.GroupIndex).Msg("get_group failed")
 				continue
@@ -107,24 +119,92 @@ func main() {
 }
 
 // callContract invokes a read-only contract method via `stellar contract invoke`.
-// Requires `stellar` CLI in PATH.
-func callContract(cfg *config.Config, method string, args ...string) ([]byte, error) {
+// Requires `stellar` CLI in PATH. Retries with exponential backoff on any CLI
+// failure, treating 429/rate-limit/timeout signals as the expected transient case.
+func callContract(ctx context.Context, logger zerolog.Logger, cfg *config.Config, method string, args ...string) ([]byte, error) {
+	const maxAttempts = 6
+	var backoff time.Duration
+
 	cmdArgs := []string{
 		"contract", "invoke",
 		"--id", cfg.RegistryContractID,
 		"--source-account", cfg.StellarSourceAccount,
-		"--network", "testnet",
+		"--rpc-url", cfg.SorobanRPCURL,
 		"--network-passphrase", cfg.NetworkPassphrase,
 		"--",
 		method,
 	}
 	cmdArgs = append(cmdArgs, args...)
-	cmd := exec.Command("stellar", cmdArgs...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", err, string(out))
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		var stdout, stderr bytes.Buffer
+		cmd := exec.CommandContext(ctx, "stellar", cmdArgs...)
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		if err == nil {
+			return bytes.TrimSpace(stdout.Bytes()), nil
+		}
+
+		stderrStr := strings.TrimSpace(stderr.String())
+		stdoutStr := strings.TrimSpace(stdout.String())
+		retryable := isRetryableOutput(stderrStr) || isRetryableOutput(stdoutStr)
+
+		// Prefer stderr for diagnostics; fall back to stdout if stderr is empty.
+		diagStr := stderrStr
+		if diagStr == "" {
+			diagStr = stdoutStr
+		}
+
+		if attempt == maxAttempts || !retryable {
+			return nil, fmt.Errorf("%s (attempt %d/%d): %w: %s", method, attempt, maxAttempts, err, diagStr)
+		}
+
+		backoff = nextBackoff(backoff)
+		logger.Warn().
+			Str("method", method).
+			Int("attempt", attempt).
+			Dur("backoff", backoff).
+			Str("output", stderrStr).
+			Msg("callContract retrying after transient error")
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
 	}
-	return out, nil
+
+	// unreachable
+	return nil, fmt.Errorf("%s: max attempts exceeded", method)
+}
+
+// isRetryableOutput reports whether the stellar CLI output indicates a transient
+// error that is worth retrying (rate limit, rejection, network timeout).
+func isRetryableOutput(out string) bool {
+	lowered := strings.ToLower(out)
+	for _, signal := range []string{"429", "rejected", "too many requests", "rate limit", "timeout", "connection refused", "context deadline exceeded"} {
+		if strings.Contains(lowered, signal) {
+			return true
+		}
+	}
+	return false
+}
+
+// nextBackoff doubles the backoff duration, starting at 1s and capping at 30s.
+func nextBackoff(current time.Duration) time.Duration {
+	if current == 0 {
+		return 1 * time.Second
+	}
+	next := current * 2
+	if next > 30*time.Second {
+		return 30 * time.Second
+	}
+	return next
 }
 
 type PairInfo struct {

@@ -58,7 +58,7 @@ func main() {
 	}
 	defer rdb.Close()
 
-	rpc := soroban.New(cfg.SorobanRPCURL, cfg.SorobanRPCBackupURL)
+	rpc := soroban.New(cfg.SorobanRPCURL)
 
 	// Trade state: load from DB, keep fresh via Redis.
 	state := keeper.NewTradeState(logger)

@@ -9,7 +9,6 @@ import (
 
 type Config struct {
 	SorobanRPCURL        string        `mapstructure:"soroban_rpc_url"`
-	SorobanRPCBackupURL  string        `mapstructure:"soroban_rpc_backup_url"`
 	NetworkPassphrase    string        `mapstructure:"network_passphrase"`
 	PMContractID         string        `mapstructure:"pm_contract_id"`
 	VaultContractID      string        `mapstructure:"vault_contract_id"`
@@ -58,7 +57,7 @@ func Load() (*Config, error) {
 	// pm_contract_id, ...) are silently dropped when .env is absent — e.g. inside
 	// a container where env comes from the process environment, not a .env file.
 	for _, key := range []string{
-		"soroban_rpc_url", "soroban_rpc_backup_url", "network_passphrase",
+		"soroban_rpc_url", "network_passphrase",
 		"pm_contract_id", "vault_contract_id", "registry_contract_id", "oracle_contract_id",
 		"database_url", "redis_url",
 		"indexer_poll_interval", "indexer_start_ledger",

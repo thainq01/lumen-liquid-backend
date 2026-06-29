@@ -45,7 +45,7 @@ func main() {
 	defer rdb.Close()
 	pub := pubsub.NewPublisher(rdb)
 
-	rpc := soroban.New(cfg.SorobanRPCURL, cfg.SorobanRPCBackupURL)
+	rpc := soroban.New(cfg.SorobanRPCURL)
 	repo := store.New(pool)
 
 	contracts := collectContractIDs(cfg)
