@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -188,11 +189,10 @@ func pollOnce(
 			return err
 		}
 	}
-	if len(resp.Events) == 0 {
-		return nil
-	}
 
-	logger.Debug().Int("n", len(resp.Events)).Msg("got events")
+	if n := len(resp.Events); n > 0 {
+		logger.Debug().Int("n", n).Msg("got events")
+	}
 
 	for i, ev := range resp.Events {
 		decoded, err := events.Decode(ev, cfg.PMContractID, cfg.VaultContractID, cfg.RegistryContractID)
@@ -211,13 +211,38 @@ func pollOnce(
 		}
 	}
 
+	// Always advance the cursor — even with zero matching events the RPC has
+	// scanned a bounded (~10k-ledger) window forward and returns a cursor past
+	// it. Dropping that cursor here re-scans the same window every poll and the
+	// indexer never progresses (the cause of a frozen last_ledger). Advancing
+	// startLedger to the cursor's ledger also keeps last_ledger reflecting real
+	// scan progress for monitoring.
 	if resp.Cursor != "" {
 		*cursor = resp.Cursor
+		if l, ok := ledgerFromCursor(resp.Cursor); ok && l > *startLedger {
+			*startLedger = l
+		}
 	}
 	if err := repo.WriteCursor(ctx, uint64(*startLedger), *cursor); err != nil {
 		return fmt.Errorf("write cursor: %w", err)
 	}
 	return nil
+}
+
+// ledgerFromCursor extracts the ledger sequence from a getEvents pagination
+// cursor. The cursor is a "<toid>-<event>" string where the TOID encodes the
+// ledger sequence in its high 32 bits. Returns false if the cursor can't be
+// parsed (callers keep their current ledger in that case).
+func ledgerFromCursor(cursor string) (uint32, bool) {
+	toidStr := cursor
+	if i := strings.IndexByte(cursor, '-'); i >= 0 {
+		toidStr = cursor[:i]
+	}
+	toid, err := strconv.ParseUint(toidStr, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return uint32(toid >> 32), true
 }
 
 func logEvent(logger zerolog.Logger, e events.Event) {
