@@ -109,14 +109,17 @@ func applyPM(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error
 		_, err := tx.Exec(ctx, `
 			INSERT INTO trades (
 			  trader, pair_index, trade_index, is_long, leverage,
-			  collateral, open_price, tp_price, sl_price, liq_price,
+			  collateral, open_price, acc_rollover_open, acc_funding_open,
+			  tp_price, sl_price, liq_price,
 			  liq_threshold_p, open_fee, opened_at, opened_tx
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 			ON CONFLICT (trader, pair_index, trade_index) DO UPDATE
 			  SET is_long      = EXCLUDED.is_long,
 			      leverage     = EXCLUDED.leverage,
 			      collateral   = EXCLUDED.collateral,
 			      open_price   = EXCLUDED.open_price,
+			      acc_rollover_open = EXCLUDED.acc_rollover_open,
+			      acc_funding_open  = EXCLUDED.acc_funding_open,
 			      tp_price     = EXCLUDED.tp_price,
 			      sl_price     = EXCLUDED.sl_price,
 			      liq_price    = EXCLUDED.liq_price,
@@ -124,6 +127,7 @@ func applyPM(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error
 			e.Trader, e.Trade.PairIndex, *e.TradeIndex,
 			e.Trade.IsLong, e.Trade.Leverage,
 			bigStr(e.Trade.Collateral), bigStr(e.Trade.OpenPrice),
+			bigStr(e.Trade.AccRolloverOpen), bigStr(e.Trade.AccFundingOpen),
 			bigStr(e.Trade.TpPrice), bigStr(e.Trade.SlPrice),
 			bigStr(liqPrice), 90, bigStr(e.OpenFee), at, e.TxHash,
 		)
@@ -209,17 +213,20 @@ func closeTrade(ctx context.Context, tx pgx.Tx, e events.Event, reason string, a
 		  DELETE FROM trades
 		   WHERE trader = $1 AND pair_index = $2 AND trade_index = $3
 		   RETURNING trader, pair_index, trade_index, is_long, leverage,
-		             collateral, open_price, tp_price, sl_price, open_fee,
+		             collateral, open_price, acc_rollover_open, acc_funding_open,
+		             tp_price, sl_price, open_fee,
 		             opened_at, opened_tx
 		)
 		INSERT INTO trade_history (
 		  trader, pair_index, trade_index, is_long, leverage,
-		  collateral, open_price, close_price, tp_price, sl_price,
+		  collateral, open_price, close_price, acc_rollover_open, acc_funding_open,
+		  tp_price, sl_price,
 		  realized_pnl, open_fee, close_fee,
 		  close_reason, opened_at, opened_tx, closed_at, closed_tx
 		)
 		SELECT trader, pair_index, trade_index, is_long, leverage,
-		       collateral, open_price, $7, tp_price, sl_price,
+		       collateral, open_price, $7, acc_rollover_open, acc_funding_open,
+		       tp_price, sl_price,
 		       $8, open_fee, $9,
 		       $4, opened_at, opened_tx, $5, $6
 		  FROM del

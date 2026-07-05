@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS trades (
   leverage      INTEGER   NOT NULL,
   collateral    NUMERIC   NOT NULL,
   open_price    NUMERIC   NOT NULL,
+  acc_rollover_open NUMERIC NOT NULL DEFAULT 0,
+  acc_funding_open  NUMERIC NOT NULL DEFAULT 0,
   tp_price      NUMERIC   NOT NULL DEFAULT 0,
   sl_price      NUMERIC   NOT NULL DEFAULT 0,
   liq_price     NUMERIC,                              -- precomputed at open
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS trade_history (
   collateral    NUMERIC   NOT NULL,
   open_price    NUMERIC   NOT NULL,
   close_price   NUMERIC,
+  acc_rollover_open NUMERIC NOT NULL DEFAULT 0,
+  acc_funding_open  NUMERIC NOT NULL DEFAULT 0,
   tp_price      NUMERIC   NOT NULL DEFAULT 0,
   sl_price      NUMERIC   NOT NULL DEFAULT 0,
   realized_pnl  NUMERIC,

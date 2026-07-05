@@ -80,6 +80,135 @@ GET /v1/trades/{trader}
 
 ---
 
+### Get Trading Pairs
+
+Retrieve every configured pair with the linked group object when available.
+
+```
+GET /v1/pairs
+```
+
+**Response:** `200 OK`
+```json
+{
+  "pairs": [
+    {
+      "pair_index": 0,
+      "symbol": "BTC/USD",
+      "reflector_asset_type": "stellar",
+      "reflector_asset": "C...",
+      "group_index": 0,
+      "spread_p": "10000000",
+      "min_leverage": 1,
+      "max_leverage": 10,
+      "min_lev_pos_usdc": "100000000",
+      "max_oi_usdc": "100000000000",
+      "max_neg_pnl_p": "9000000000",
+      "liq_threshold_p": 90,
+      "max_gain_p": 900,
+      "disabled": false,
+      "one_percent_depth": "0",
+      "synced_at": "2026-06-19T10:00:00Z",
+      "group": {
+        "group_index": 0,
+        "name": "crypto",
+        "max_collateral_usdc": "10000000000",
+        "open_fee_p": "10000000",
+        "close_fee_p": "10000000",
+        "synced_at": "2026-06-19T10:00:00Z"
+      }
+    }
+  ]
+}
+```
+
+### Get One Trading Pair
+
+```
+GET /v1/pairs/{pair_index}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "pair": {
+    "pair_index": 0,
+    "symbol": "BTC/USD",
+    "reflector_asset_type": "stellar",
+    "reflector_asset": "C...",
+    "group_index": 0,
+    "spread_p": "10000000",
+    "min_leverage": 1,
+    "max_leverage": 10,
+    "min_lev_pos_usdc": "100000000",
+    "max_oi_usdc": "100000000000",
+    "max_neg_pnl_p": "9000000000",
+    "liq_threshold_p": 90,
+    "max_gain_p": 900,
+    "disabled": false,
+    "one_percent_depth": "0",
+    "synced_at": "2026-06-19T10:00:00Z",
+    "group": {
+      "group_index": 0,
+      "name": "crypto",
+      "max_collateral_usdc": "10000000000",
+      "open_fee_p": "10000000",
+      "close_fee_p": "10000000",
+      "synced_at": "2026-06-19T10:00:00Z"
+    }
+  }
+}
+```
+
+### Get Pair Groups
+
+Retrieve every configured pair group.
+
+```
+GET /v1/pair-groups
+```
+
+**Response:** `200 OK`
+```json
+{
+  "groups": [
+    {
+      "group_index": 0,
+      "name": "crypto",
+      "max_collateral_usdc": "10000000000",
+      "open_fee_p": "10000000",
+      "close_fee_p": "10000000",
+      "synced_at": "2026-06-19T10:00:00Z"
+    }
+  ]
+}
+```
+
+### Get One Pair Group
+
+```
+GET /v1/pair-groups/{group_index}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "group": {
+    "group_index": 0,
+    "name": "crypto",
+    "max_collateral_usdc": "10000000000",
+    "open_fee_p": "10000000",
+    "close_fee_p": "10000000",
+    "synced_at": "2026-06-19T10:00:00Z"
+  }
+}
+```
+
+Pair and group numeric amounts are raw integer strings. `*_usdc` fields use
+`USDC_SCALE` (`1e7`) and `*_p` fields use `P_SCALE` (`1e10`).
+
+---
+
 ### Get Trading History
 
 Retrieve closed trade history for a trader (paginated).

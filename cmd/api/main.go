@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,6 +90,16 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
+	// REST: Get pair and group configuration
+	r.Get("/v1/pairs", handleGetPairs(pool))
+	r.Get("/v1/pairs/{pair_index}", handleGetPair(pool))
+	r.Get("/v1/pair-groups", handleGetPairGroups(pool))
+	r.Get("/v1/pair-groups/{group_index}", handleGetPairGroup(pool))
+	r.Get("/api/v1/pairs", handleGetPairs(pool))
+	r.Get("/api/v1/pairs/{pair_index}", handleGetPair(pool))
+	r.Get("/api/v1/pair-groups", handleGetPairGroups(pool))
+	r.Get("/api/v1/pair-groups/{group_index}", handleGetPairGroup(pool))
+
 	// REST: Get trader's open trades
 	r.Get("/v1/trades/{trader}", handleGetTrades(pool))
 
@@ -133,13 +144,173 @@ func main() {
 	srv.Shutdown(shutdownCtx)
 }
 
+type pairGroupResponse struct {
+	GroupIndex        int       `json:"group_index"`
+	Name              string    `json:"name"`
+	MaxCollateralUsdc string    `json:"max_collateral_usdc"`
+	OpenFeeP          string    `json:"open_fee_p"`
+	CloseFeeP         string    `json:"close_fee_p"`
+	SyncedAt          time.Time `json:"synced_at"`
+}
+
+type pairResponse struct {
+	PairIndex          int                `json:"pair_index"`
+	Symbol             string             `json:"symbol"`
+	ReflectorAssetType string             `json:"reflector_asset_type"`
+	ReflectorAsset     string             `json:"reflector_asset"`
+	GroupIndex         int                `json:"group_index"`
+	SpreadP            string             `json:"spread_p"`
+	MinLeverage        int                `json:"min_leverage"`
+	MaxLeverage        int                `json:"max_leverage"`
+	MinLevPosUsdc      string             `json:"min_lev_pos_usdc"`
+	MaxOiUsdc          string             `json:"max_oi_usdc"`
+	MaxNegPnlP         string             `json:"max_neg_pnl_p"`
+	LiqThresholdP      int                `json:"liq_threshold_p"`
+	MaxGainP           int                `json:"max_gain_p"`
+	Disabled           bool               `json:"disabled"`
+	OnePercentDepth    string             `json:"one_percent_depth"`
+	SyncedAt           time.Time          `json:"synced_at"`
+	Group              *pairGroupResponse `json:"group,omitempty"`
+}
+
+func handleGetPairs(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groups, err := loadPairGroups(r.Context(), pool)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		rows, err := pool.Query(r.Context(), `
+			SELECT pair_index, symbol, reflector_asset_type, reflector_asset,
+			       group_index, spread_p, min_leverage, max_leverage,
+			       min_lev_pos_usdc, max_oi_usdc, max_neg_pnl_p,
+			       liq_threshold_p, max_gain_p, disabled, one_percent_depth, synced_at
+			FROM pairs
+			ORDER BY pair_index`)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		pairs := []pairResponse{}
+		for rows.Next() {
+			p, err := scanPair(rows)
+			if err != nil {
+				http.Error(w, "query failed", http.StatusInternalServerError)
+				return
+			}
+			if group, ok := groups[p.GroupIndex]; ok {
+				p.Group = &group
+			}
+			pairs = append(pairs, p)
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, map[string]any{"pairs": pairs})
+	}
+}
+
+func handleGetPair(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		pairIndex, err := strconv.Atoi(chi.URLParam(r, "pair_index"))
+		if err != nil || pairIndex < 0 {
+			http.Error(w, "invalid pair_index", http.StatusBadRequest)
+			return
+		}
+
+		var p pairResponse
+		err = pool.QueryRow(r.Context(), `
+			SELECT pair_index, symbol, reflector_asset_type, reflector_asset,
+			       group_index, spread_p, min_leverage, max_leverage,
+			       min_lev_pos_usdc, max_oi_usdc, max_neg_pnl_p,
+			       liq_threshold_p, max_gain_p, disabled, one_percent_depth, synced_at
+			FROM pairs
+			WHERE pair_index = $1`,
+			pairIndex,
+		).Scan(
+			&p.PairIndex, &p.Symbol, &p.ReflectorAssetType, &p.ReflectorAsset,
+			&p.GroupIndex, &p.SpreadP, &p.MinLeverage, &p.MaxLeverage,
+			&p.MinLevPosUsdc, &p.MaxOiUsdc, &p.MaxNegPnlP,
+			&p.LiqThresholdP, &p.MaxGainP, &p.Disabled, &p.OnePercentDepth, &p.SyncedAt,
+		)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				http.Error(w, "pair not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		group, err := loadPairGroup(r.Context(), pool, p.GroupIndex)
+		if err == nil {
+			p.Group = &group
+		} else if err != pgx.ErrNoRows {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, map[string]any{"pair": p})
+	}
+}
+
+func handleGetPairGroups(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groupsByIndex, err := loadPairGroups(r.Context(), pool)
+		if err != nil {
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		groups := []pairGroupResponse{}
+		indexes := make([]int, 0, len(groupsByIndex))
+		for idx := range groupsByIndex {
+			indexes = append(indexes, idx)
+		}
+		sort.Ints(indexes)
+		for _, idx := range indexes {
+			groups = append(groups, groupsByIndex[idx])
+		}
+
+		writeJSON(w, map[string]any{"groups": groups})
+	}
+}
+
+func handleGetPairGroup(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groupIndex, err := strconv.Atoi(chi.URLParam(r, "group_index"))
+		if err != nil || groupIndex < 0 {
+			http.Error(w, "invalid group_index", http.StatusBadRequest)
+			return
+		}
+
+		group, err := loadPairGroup(r.Context(), pool, groupIndex)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				http.Error(w, "group not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "query failed", http.StatusInternalServerError)
+			return
+		}
+
+		writeJSON(w, map[string]any{"group": group})
+	}
+}
+
 func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		trader := chi.URLParam(r, "trader")
 
 		rows, err := pool.Query(r.Context(), `
 			SELECT trader, pair_index, trade_index, is_long, leverage,
-				   collateral, open_price, tp_price, sl_price, liq_price, opened_at
+				   collateral, open_price, acc_rollover_open, acc_funding_open,
+				   tp_price, sl_price, liq_price, opened_at
 			FROM trades WHERE trader = $1
 			ORDER BY pair_index, trade_index`,
 			trader,
@@ -156,12 +327,14 @@ func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 			var isLong bool
 			var lev int
 			var pairIdx, tradeIdx int
-			var collateral, openPrice, tpPrice, slPrice, liqPrice string
+			var collateral, openPrice, accRolloverOpen, accFundingOpen string
+			var tpPrice, slPrice, liqPrice string
 			var openedAt time.Time
 			var traderAddr string
 
 			if err := rows.Scan(&traderAddr, &pairIdx, &tradeIdx, &isLong, &lev,
-				&collateral, &openPrice, &tpPrice, &slPrice, &liqPrice, &openedAt); err != nil {
+				&collateral, &openPrice, &accRolloverOpen, &accFundingOpen,
+				&tpPrice, &slPrice, &liqPrice, &openedAt); err != nil {
 				continue
 			}
 
@@ -172,6 +345,8 @@ func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 			t["leverage"] = lev
 			t["collateral"] = collateral
 			t["open_price"] = openPrice
+			t["acc_rollover_open"] = accRolloverOpen
+			t["acc_funding_open"] = accFundingOpen
 			t["tp_price"] = tpPrice
 			t["sl_price"] = slPrice
 			t["liq_price"] = liqPrice
@@ -213,7 +388,8 @@ func handleGetTradingHistory(pool *pgxpool.Pool) http.HandlerFunc {
 		var err error
 		baseSelect := `
 			SELECT pair_index, trade_index, is_long, leverage, collateral,
-			       open_price, close_price, tp_price, sl_price,
+			       open_price, close_price, acc_rollover_open, acc_funding_open,
+			       tp_price, sl_price,
 			       realized_pnl, open_fee, close_fee, close_reason,
 			       opened_at, opened_tx, closed_at, closed_tx
 			FROM trade_history WHERE trader = $1`
@@ -243,36 +419,40 @@ func handleGetTradingHistory(pool *pgxpool.Pool) http.HandlerFunc {
 		for rows.Next() {
 			var pairIdx, tradeIdx, leverage int
 			var isLong bool
-			var collateral, openPrice, tpPrice, slPrice string
+			var collateral, openPrice, accRolloverOpen, accFundingOpen string
+			var tpPrice, slPrice string
 			var closePrice, realizedPnl, openFee, closeFee *string
 			var closeReason, openedTx, closedTx string
 			var openedAt, closedAt time.Time
 
 			if err := rows.Scan(&pairIdx, &tradeIdx, &isLong, &leverage, &collateral,
-				&openPrice, &closePrice, &tpPrice, &slPrice,
+				&openPrice, &closePrice, &accRolloverOpen, &accFundingOpen,
+				&tpPrice, &slPrice,
 				&realizedPnl, &openFee, &closeFee, &closeReason,
 				&openedAt, &openedTx, &closedAt, &closedTx); err != nil {
 				continue
 			}
 			lastClosedAt = closedAt
 			history = append(history, map[string]any{
-				"pair_index":   pairIdx,
-				"trade_index":  tradeIdx,
-				"is_long":      isLong,
-				"leverage":     leverage,
-				"collateral":   collateral,
-				"open_price":   openPrice,
-				"close_price":  closePrice,
-				"tp_price":     tpPrice,
-				"sl_price":     slPrice,
-				"realized_pnl": realizedPnl,
-				"open_fee":     openFee,
-				"close_fee":    closeFee,
-				"close_reason": closeReason,
-				"opened_at":    openedAt.Format(time.RFC3339),
-				"opened_tx":    openedTx,
-				"closed_at":    closedAt.Format(time.RFC3339),
-				"closed_tx":    closedTx,
+				"pair_index":        pairIdx,
+				"trade_index":       tradeIdx,
+				"is_long":           isLong,
+				"leverage":          leverage,
+				"collateral":        collateral,
+				"open_price":        openPrice,
+				"close_price":       closePrice,
+				"acc_rollover_open": accRolloverOpen,
+				"acc_funding_open":  accFundingOpen,
+				"tp_price":          tpPrice,
+				"sl_price":          slPrice,
+				"realized_pnl":      realizedPnl,
+				"open_fee":          openFee,
+				"close_fee":         closeFee,
+				"close_reason":      closeReason,
+				"opened_at":         openedAt.Format(time.RFC3339),
+				"opened_tx":         openedTx,
+				"closed_at":         closedAt.Format(time.RFC3339),
+				"closed_tx":         closedTx,
 			})
 		}
 
@@ -294,6 +474,64 @@ func handleGetTradingHistory(pool *pgxpool.Pool) http.HandlerFunc {
 			"has_more":    hasMore,
 		})
 	}
+}
+
+type pairScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPair(row pairScanner) (pairResponse, error) {
+	var p pairResponse
+	err := row.Scan(
+		&p.PairIndex, &p.Symbol, &p.ReflectorAssetType, &p.ReflectorAsset,
+		&p.GroupIndex, &p.SpreadP, &p.MinLeverage, &p.MaxLeverage,
+		&p.MinLevPosUsdc, &p.MaxOiUsdc, &p.MaxNegPnlP,
+		&p.LiqThresholdP, &p.MaxGainP, &p.Disabled, &p.OnePercentDepth, &p.SyncedAt,
+	)
+	return p, err
+}
+
+func loadPairGroups(ctx context.Context, pool *pgxpool.Pool) (map[int]pairGroupResponse, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT group_index, name, max_collateral_usdc, open_fee_p, close_fee_p, synced_at
+		FROM pair_groups
+		ORDER BY group_index`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	groups := make(map[int]pairGroupResponse)
+	for rows.Next() {
+		var group pairGroupResponse
+		if err := rows.Scan(
+			&group.GroupIndex, &group.Name, &group.MaxCollateralUsdc,
+			&group.OpenFeeP, &group.CloseFeeP, &group.SyncedAt,
+		); err != nil {
+			return nil, err
+		}
+		groups[group.GroupIndex] = group
+	}
+	return groups, rows.Err()
+}
+
+func loadPairGroup(ctx context.Context, pool *pgxpool.Pool, groupIndex int) (pairGroupResponse, error) {
+	var group pairGroupResponse
+	err := pool.QueryRow(ctx, `
+		SELECT group_index, name, max_collateral_usdc, open_fee_p, close_fee_p, synced_at
+		FROM pair_groups
+		WHERE group_index = $1`,
+		groupIndex,
+	).Scan(
+		&group.GroupIndex, &group.Name, &group.MaxCollateralUsdc,
+		&group.OpenFeeP, &group.CloseFeeP, &group.SyncedAt,
+	)
+	return group, err
+}
+
+func writeJSON(w http.ResponseWriter, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(payload)
 }
 
 func mustParseRFC3339(s string) time.Time {
@@ -378,9 +616,10 @@ func jsonMarshalTrades(trades []map[string]any) ([]byte, error) {
 			result = append(result, ',')
 		}
 		result = append(result, fmt.Sprintf(
-			`{"trader":"%s","pair_index":%d,"trade_index":%d,"is_long":%v,"leverage":%d,"collateral":"%s","open_price":"%s","tp_price":"%s","sl_price":"%s","liq_price":"%s","opened_at":"%s"}`,
+			`{"trader":"%s","pair_index":%d,"trade_index":%d,"is_long":%v,"leverage":%d,"collateral":"%s","open_price":"%s","acc_rollover_open":"%s","acc_funding_open":"%s","tp_price":"%s","sl_price":"%s","liq_price":"%s","opened_at":"%s"}`,
 			t["trader"], t["pair_index"], t["trade_index"], t["is_long"], t["leverage"],
-			t["collateral"], t["open_price"], t["tp_price"], t["sl_price"], t["liq_price"], t["opened_at"].(time.Time).Format(time.RFC3339),
+			t["collateral"], t["open_price"], t["acc_rollover_open"], t["acc_funding_open"],
+			t["tp_price"], t["sl_price"], t["liq_price"], t["opened_at"].(time.Time).Format(time.RFC3339),
 		)...)
 	}
 	result = append(result, ']')

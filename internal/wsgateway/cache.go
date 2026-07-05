@@ -17,17 +17,19 @@ import (
 
 // CachedTrade is a trader's open position, sent over WebSocket.
 type CachedTrade struct {
-	Trader     string `json:"trader"`
-	PairIndex  int    `json:"pair_index"`
-	TradeIndex int    `json:"trade_index"`
-	IsLong     bool   `json:"is_long"`
-	Leverage   int    `json:"leverage"`
-	Collateral string `json:"collateral"`
-	OpenPrice  string `json:"open_price"`
-	TpPrice    string `json:"tp_price"`
-	SlPrice    string `json:"sl_price"`
-	LiqPrice   string `json:"liq_price"`
-	OpenedAt   string `json:"opened_at"`
+	Trader          string `json:"trader"`
+	PairIndex       int    `json:"pair_index"`
+	TradeIndex      int    `json:"trade_index"`
+	IsLong          bool   `json:"is_long"`
+	Leverage        int    `json:"leverage"`
+	Collateral      string `json:"collateral"`
+	OpenPrice       string `json:"open_price"`
+	AccRolloverOpen string `json:"acc_rollover_open"`
+	AccFundingOpen  string `json:"acc_funding_open"`
+	TpPrice         string `json:"tp_price"`
+	SlPrice         string `json:"sl_price"`
+	LiqPrice        string `json:"liq_price"`
+	OpenedAt        string `json:"opened_at"`
 }
 
 // CachedPair is pair config, sent alongside trades so the client has context.
@@ -105,7 +107,8 @@ func (c *TradeCache) Start(ctx context.Context) {
 func (c *TradeCache) LoadFromDB(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
 		SELECT trader, pair_index, trade_index, is_long, leverage,
-		       collateral, open_price, tp_price, sl_price, liq_price, opened_at
+		       collateral, open_price, acc_rollover_open, acc_funding_open,
+		       tp_price, sl_price, liq_price, opened_at
 		FROM trades`)
 	if err != nil {
 		return fmt.Errorf("load trades: %w", err)
@@ -118,7 +121,8 @@ func (c *TradeCache) LoadFromDB(ctx context.Context) error {
 		var t CachedTrade
 		var openedAt time.Time
 		if err := rows.Scan(&t.Trader, &t.PairIndex, &t.TradeIndex, &t.IsLong,
-			&t.Leverage, &t.Collateral, &t.OpenPrice, &t.TpPrice, &t.SlPrice,
+			&t.Leverage, &t.Collateral, &t.OpenPrice,
+			&t.AccRolloverOpen, &t.AccFundingOpen, &t.TpPrice, &t.SlPrice,
 			&t.LiqPrice, &openedAt); err != nil {
 			continue
 		}
@@ -335,17 +339,19 @@ func buildTrade(e *events.Event) CachedTrade {
 		nil, nil, 90,
 	)
 	return CachedTrade{
-		Trader:     e.Trader,
-		PairIndex:  int(e.Trade.PairIndex),
-		TradeIndex: int(*e.TradeIndex),
-		IsLong:     e.Trade.IsLong,
-		Leverage:   int(e.Trade.Leverage),
-		Collateral: bigStr(e.Trade.Collateral),
-		OpenPrice:  bigStr(e.Trade.OpenPrice),
-		TpPrice:    bigStr(e.Trade.TpPrice),
-		SlPrice:    bigStr(e.Trade.SlPrice),
-		LiqPrice:   bigStr(liqPrice),
-		OpenedAt:   e.OccurredAt,
+		Trader:          e.Trader,
+		PairIndex:       int(e.Trade.PairIndex),
+		TradeIndex:      int(*e.TradeIndex),
+		IsLong:          e.Trade.IsLong,
+		Leverage:        int(e.Trade.Leverage),
+		Collateral:      bigStr(e.Trade.Collateral),
+		OpenPrice:       bigStr(e.Trade.OpenPrice),
+		AccRolloverOpen: bigStr(e.Trade.AccRolloverOpen),
+		AccFundingOpen:  bigStr(e.Trade.AccFundingOpen),
+		TpPrice:         bigStr(e.Trade.TpPrice),
+		SlPrice:         bigStr(e.Trade.SlPrice),
+		LiqPrice:        bigStr(liqPrice),
+		OpenedAt:        e.OccurredAt,
 	}
 }
 
