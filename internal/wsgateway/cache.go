@@ -29,6 +29,9 @@ type CachedTrade struct {
 	TpPrice         string `json:"tp_price"`
 	SlPrice         string `json:"sl_price"`
 	LiqPrice        string `json:"liq_price"`
+	CurrentLiqPrice string `json:"current_liq_price"`
+	RolloverFee     string `json:"rollover_fee"`
+	FundingFee      string `json:"funding_fee"`
 	OpenedAt        string `json:"opened_at"`
 }
 
@@ -106,10 +109,14 @@ func (c *TradeCache) Start(ctx context.Context) {
 // LoadFromDB seeds the cache with current open trades and pair configs.
 func (c *TradeCache) LoadFromDB(ctx context.Context) error {
 	rows, err := c.pool.Query(ctx, `
-		SELECT trader, pair_index, trade_index, is_long, leverage,
-		       collateral, open_price, acc_rollover_open, acc_funding_open,
-		       tp_price, sl_price, liq_price, opened_at
-		FROM trades`)
+		SELECT t.trader, t.pair_index, t.trade_index, t.is_long, t.leverage,
+		       t.collateral, t.open_price, t.acc_rollover_open, t.acc_funding_open,
+		       t.tp_price, t.sl_price, t.liq_price, COALESCE(p.liq_threshold_p, t.liq_threshold_p),
+		       a.acc_rollover, a.acc_funding_long, a.acc_funding_short,
+		       t.opened_at
+		FROM trades t
+		LEFT JOIN pairs p ON p.pair_index = t.pair_index
+		LEFT JOIN pair_fee_accumulators a ON a.pair_index = t.pair_index`)
 	if err != nil {
 		return fmt.Errorf("load trades: %w", err)
 	}
@@ -120,12 +127,17 @@ func (c *TradeCache) LoadFromDB(ctx context.Context) error {
 	for rows.Next() {
 		var t CachedTrade
 		var openedAt time.Time
+		var liqThresholdP uint32
+		var accRolloverNow, accFundingLongNow, accFundingShortNow *string
 		if err := rows.Scan(&t.Trader, &t.PairIndex, &t.TradeIndex, &t.IsLong,
 			&t.Leverage, &t.Collateral, &t.OpenPrice,
 			&t.AccRolloverOpen, &t.AccFundingOpen, &t.TpPrice, &t.SlPrice,
-			&t.LiqPrice, &openedAt); err != nil {
+			&t.LiqPrice, &liqThresholdP,
+			&accRolloverNow, &accFundingLongNow, &accFundingShortNow,
+			&openedAt); err != nil {
 			continue
 		}
+		setDynamicTradeFees(&t, liqThresholdP, accRolloverNow, accFundingLongNow, accFundingShortNow)
 		t.OpenedAt = openedAt.Format(time.RFC3339)
 		c.trades[t.Trader] = append(c.trades[t.Trader], t)
 	}
@@ -281,6 +293,7 @@ func (c *TradeCache) GetSnapshot(trader string) ([]byte, error) {
 	if trades == nil {
 		trades = []CachedTrade{}
 	}
+	trades = c.enrichTrades(context.Background(), trades)
 	limits := c.limits[trader]
 	if limits == nil {
 		limits = []CachedLimit{}
@@ -316,6 +329,7 @@ func (c *TradeCache) GetAllSnapshot() ([]byte, error) {
 	for _, list := range c.trades {
 		all = append(all, list...)
 	}
+	all = c.enrichTrades(context.Background(), all)
 	allLimits := []CachedLimit{}
 	for _, list := range c.limits {
 		allLimits = append(allLimits, list...)
@@ -338,7 +352,7 @@ func buildTrade(e *events.Event) CachedTrade {
 		e.Trade.Collateral, e.Trade.Leverage,
 		nil, nil, 90,
 	)
-	return CachedTrade{
+	t := CachedTrade{
 		Trader:          e.Trader,
 		PairIndex:       int(e.Trade.PairIndex),
 		TradeIndex:      int(*e.TradeIndex),
@@ -351,8 +365,145 @@ func buildTrade(e *events.Event) CachedTrade {
 		TpPrice:         bigStr(e.Trade.TpPrice),
 		SlPrice:         bigStr(e.Trade.SlPrice),
 		LiqPrice:        bigStr(liqPrice),
+		CurrentLiqPrice: bigStr(liqPrice),
+		RolloverFee:     "0",
+		FundingFee:      "0",
 		OpenedAt:        e.OccurredAt,
 	}
+	return t
+}
+
+type pairFeeSnapshot struct {
+	liqThresholdP   uint32
+	accRollover     string
+	accFundingLong  string
+	accFundingShort string
+}
+
+func (c *TradeCache) enrichTrades(ctx context.Context, trades []CachedTrade) []CachedTrade {
+	if len(trades) == 0 || c.pool == nil {
+		return trades
+	}
+	rows, err := c.pool.Query(ctx, `
+		SELECT p.pair_index, p.liq_threshold_p,
+		       a.acc_rollover, a.acc_funding_long, a.acc_funding_short
+		FROM pairs p
+		LEFT JOIN pair_fee_accumulators a ON a.pair_index = p.pair_index`)
+	if err != nil {
+		return trades
+	}
+	defer rows.Close()
+
+	fees := make(map[int]pairFeeSnapshot)
+	for rows.Next() {
+		var pairIdx int
+		var snap pairFeeSnapshot
+		var accRollover, accFundingLong, accFundingShort *string
+		if err := rows.Scan(&pairIdx, &snap.liqThresholdP, &accRollover, &accFundingLong, &accFundingShort); err != nil {
+			continue
+		}
+		if accRollover != nil {
+			snap.accRollover = *accRollover
+		}
+		if accFundingLong != nil {
+			snap.accFundingLong = *accFundingLong
+		}
+		if accFundingShort != nil {
+			snap.accFundingShort = *accFundingShort
+		}
+		fees[pairIdx] = snap
+	}
+
+	out := make([]CachedTrade, len(trades))
+	copy(out, trades)
+	for i := range out {
+		snap, ok := fees[out[i].PairIndex]
+		if !ok || snap.accRollover == "" || snap.accFundingLong == "" || snap.accFundingShort == "" {
+			ensureDynamicDefaults(&out[i])
+			continue
+		}
+		accRollover, accFundingLong, accFundingShort := snap.accRollover, snap.accFundingLong, snap.accFundingShort
+		setDynamicTradeFees(&out[i], snap.liqThresholdP, &accRollover, &accFundingLong, &accFundingShort)
+	}
+	return out
+}
+
+func setDynamicTradeFees(t *CachedTrade, liqThresholdP uint32, accRolloverNow, accFundingLongNow, accFundingShortNow *string) {
+	ensureDynamicDefaults(t)
+	if accRolloverNow == nil || accFundingLongNow == nil || accFundingShortNow == nil {
+		return
+	}
+	accFundingNow := *accFundingShortNow
+	if t.IsLong {
+		accFundingNow = *accFundingLongNow
+	}
+	rolloverFee, fundingFee, currentLiq := calculateTradeTimeFeesAndLiq(
+		t.OpenPrice, t.Collateral, t.AccRolloverOpen, t.AccFundingOpen,
+		*accRolloverNow, accFundingNow, t.IsLong, uint32(t.Leverage), liqThresholdP,
+	)
+	if rolloverFee != nil {
+		t.RolloverFee = rolloverFee.String()
+	}
+	if fundingFee != nil {
+		t.FundingFee = fundingFee.String()
+	}
+	if currentLiq != nil {
+		t.CurrentLiqPrice = currentLiq.String()
+	}
+}
+
+func ensureDynamicDefaults(t *CachedTrade) {
+	if t.CurrentLiqPrice == "" {
+		t.CurrentLiqPrice = t.LiqPrice
+	}
+	if t.RolloverFee == "" {
+		t.RolloverFee = "0"
+	}
+	if t.FundingFee == "" {
+		t.FundingFee = "0"
+	}
+}
+
+func calculateTradeTimeFeesAndLiq(
+	openPrice, collateral, accRolloverOpen, accFundingOpen string,
+	accRolloverNow, accFundingNow string,
+	isLong bool,
+	leverage uint32,
+	liqThresholdP uint32,
+) (*big.Int, *big.Int, *big.Int) {
+	open := parseBig(openPrice)
+	collat := parseBig(collateral)
+	rollOpen := parseBig(accRolloverOpen)
+	fundingOpen := parseBig(accFundingOpen)
+	rollNow := parseBig(accRolloverNow)
+	fundingNow := parseBig(accFundingNow)
+	if open == nil || collat == nil || rollOpen == nil || fundingOpen == nil || rollNow == nil || fundingNow == nil {
+		return nil, nil, nil
+	}
+	rolloverFee, err := keeper.RolloverFeeForTrade(rollOpen, rollNow, collat)
+	if err != nil {
+		return nil, nil, nil
+	}
+	fundingFee, err := keeper.FundingFeeForTrade(fundingOpen, fundingNow, collat, leverage)
+	if err != nil {
+		return rolloverFee, nil, nil
+	}
+	if liqThresholdP == 0 {
+		liqThresholdP = 90
+	}
+	liq, err := keeper.LiquidationPrice(open, isLong, collat, leverage, rolloverFee, fundingFee, liqThresholdP)
+	if err != nil {
+		return rolloverFee, fundingFee, nil
+	}
+	return rolloverFee, fundingFee, liq
+}
+
+func parseBig(s string) *big.Int {
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return nil
+	}
+	return v
 }
 
 func hasTrade(trades []CachedTrade, pairIdx, tradeIdx int) bool {

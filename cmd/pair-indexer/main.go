@@ -18,6 +18,7 @@ import (
 	"github.com/lumenliquid/backend/internal/config"
 	"github.com/lumenliquid/backend/internal/db"
 	"github.com/lumenliquid/backend/internal/log"
+	"github.com/lumenliquid/backend/internal/soroban"
 )
 
 func main() {
@@ -42,6 +43,11 @@ func main() {
 	}
 
 	logger.Info().Str("registry", cfg.RegistryContractID).Msg("pair-indexer starting")
+	rpc := soroban.New(cfg.SorobanRPCURL)
+	latest, err := rpc.GetLatestLedger(ctx)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("get latest ledger")
+	}
 
 	// Fetch pairs_count
 	count, err := callContract(ctx, logger, cfg, "pairs_count")
@@ -91,6 +97,9 @@ func main() {
 		if err := upsertPair(ctx, pool, i, &pair, depth); err != nil {
 			logger.Error().Err(err).Uint32("pair", i).Msg("upsert pair")
 			continue
+		}
+		if err := syncFeeAccumulators(ctx, logger, cfg, pool, i, latest.Sequence); err != nil {
+			logger.Warn().Err(err).Uint32("pair", i).Uint32("ledger", latest.Sequence).Msg("sync fee accumulators failed")
 		}
 		logger.Info().Uint32("pair", i).Str("symbol", pair.Symbol).Msg("synced pair")
 
@@ -208,18 +217,18 @@ func nextBackoff(current time.Duration) time.Duration {
 }
 
 type PairInfo struct {
-	Symbol            string          `json:"symbol"`
-	ReflectorAsset    ReflectorAsset  `json:"reflector_asset"`
-	GroupIndex        uint32          `json:"group_index"`
-	SpreadP           string          `json:"spread_p"`
-	MinLeverage       uint32          `json:"min_leverage"`
-	MaxLeverage       uint32          `json:"max_leverage"`
-	MinLevPosUsdc     string          `json:"min_lev_pos_usdc"`
-	MaxOiUsdc         string          `json:"max_oi_usdc"`
-	MaxNegPnlP        string          `json:"max_neg_pnl_p"`
-	LiqThresholdP     uint32          `json:"liq_threshold_p"`
-	MaxGainP          uint32          `json:"max_gain_p"`
-	Disabled          bool            `json:"disabled"`
+	Symbol         string         `json:"symbol"`
+	ReflectorAsset ReflectorAsset `json:"reflector_asset"`
+	GroupIndex     uint32         `json:"group_index"`
+	SpreadP        string         `json:"spread_p"`
+	MinLeverage    uint32         `json:"min_leverage"`
+	MaxLeverage    uint32         `json:"max_leverage"`
+	MinLevPosUsdc  string         `json:"min_lev_pos_usdc"`
+	MaxOiUsdc      string         `json:"max_oi_usdc"`
+	MaxNegPnlP     string         `json:"max_neg_pnl_p"`
+	LiqThresholdP  uint32         `json:"liq_threshold_p"`
+	MaxGainP       uint32         `json:"max_gain_p"`
+	Disabled       bool           `json:"disabled"`
 }
 
 type ReflectorAsset struct {
@@ -228,10 +237,28 @@ type ReflectorAsset struct {
 }
 
 type Group struct {
-	Name               string `json:"name"`
-	MaxCollateralUsdc  string `json:"max_collateral_usdc"`
-	OpenFeeP           string `json:"open_fee_p"`
-	CloseFeeP          string `json:"close_fee_p"`
+	Name              string `json:"name"`
+	MaxCollateralUsdc string `json:"max_collateral_usdc"`
+	OpenFeeP          string `json:"open_fee_p"`
+	CloseFeeP         string `json:"close_fee_p"`
+}
+
+type RolloverState struct {
+	AccPerCollateral string `json:"acc_per_collateral"`
+	FeePerLedgerP    string `json:"fee_per_ledger_p"`
+	LastUpdateLedger uint32 `json:"last_update_ledger"`
+}
+
+type FundingState struct {
+	AccLong          string `json:"acc_long"`
+	AccShort         string `json:"acc_short"`
+	FeePerLedgerP    string `json:"fee_per_ledger_p"`
+	LastUpdateLedger uint32 `json:"last_update_ledger"`
+}
+
+type PairOi struct {
+	Long  string `json:"long"`
+	Short string `json:"short"`
 }
 
 func upsertPair(ctx context.Context, pool *pgxpool.Pool, idx uint32, p *PairInfo, depth string) error {
@@ -287,4 +314,114 @@ func upsertGroup(ctx context.Context, pool *pgxpool.Pool, idx uint32, g *Group) 
 		idx, g.Name, g.MaxCollateralUsdc, g.OpenFeeP, g.CloseFeeP,
 	)
 	return err
+}
+
+func syncFeeAccumulators(ctx context.Context, logger zerolog.Logger, cfg *config.Config, pool *pgxpool.Pool, pairIndex uint32, atLedger uint32) error {
+	rolloverRaw, err := callContract(ctx, logger, cfg, "get_acc_rollover", "--pair_index", fmt.Sprint(pairIndex))
+	if err != nil {
+		return fmt.Errorf("get_acc_rollover: %w", err)
+	}
+	var rollover RolloverState
+	if err := json.Unmarshal(rolloverRaw, &rollover); err != nil {
+		return fmt.Errorf("parse get_acc_rollover: %w", err)
+	}
+
+	fundingRaw, err := callContract(ctx, logger, cfg, "get_acc_funding", "--pair_index", fmt.Sprint(pairIndex))
+	if err != nil {
+		return fmt.Errorf("get_acc_funding: %w", err)
+	}
+	var funding FundingState
+	if err := json.Unmarshal(fundingRaw, &funding); err != nil {
+		return fmt.Errorf("parse get_acc_funding: %w", err)
+	}
+	oiRaw, err := callContract(ctx, logger, cfg, "get_oi", "--pair_index", fmt.Sprint(pairIndex))
+	if err != nil {
+		return fmt.Errorf("get_oi: %w", err)
+	}
+	var oi PairOi
+	if err := json.Unmarshal(oiRaw, &oi); err != nil {
+		return fmt.Errorf("parse get_oi: %w", err)
+	}
+
+	projectedRolloverRaw, err := callContract(ctx, logger, cfg,
+		"pending_acc_rollover_view",
+		"--pair_index", fmt.Sprint(pairIndex),
+		"--at_ledger", fmt.Sprint(atLedger),
+	)
+	if err != nil {
+		return fmt.Errorf("pending_acc_rollover_view: %w", err)
+	}
+	var projectedRollover string
+	if err := json.Unmarshal(projectedRolloverRaw, &projectedRollover); err != nil {
+		return fmt.Errorf("parse pending_acc_rollover_view: %w", err)
+	}
+
+	projectedFundingRaw, err := callContract(ctx, logger, cfg,
+		"pending_acc_funding_view",
+		"--pair_index", fmt.Sprint(pairIndex),
+		"--at_ledger", fmt.Sprint(atLedger),
+	)
+	if err != nil {
+		return fmt.Errorf("pending_acc_funding_view: %w", err)
+	}
+	projectedFunding, err := parseFundingPair(projectedFundingRaw)
+	if err != nil {
+		return fmt.Errorf("parse pending_acc_funding_view: %w", err)
+	}
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO pair_fee_accumulators (
+		  pair_index, acc_rollover, acc_funding_long, acc_funding_short,
+		  rollover_fee_per_ledger_p, funding_fee_per_ledger_p,
+		  projected_at_ledger, synced_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+		ON CONFLICT (pair_index) DO UPDATE
+		  SET acc_rollover              = EXCLUDED.acc_rollover,
+		      acc_funding_long          = EXCLUDED.acc_funding_long,
+		      acc_funding_short         = EXCLUDED.acc_funding_short,
+		      rollover_fee_per_ledger_p = EXCLUDED.rollover_fee_per_ledger_p,
+		      funding_fee_per_ledger_p  = EXCLUDED.funding_fee_per_ledger_p,
+		      projected_at_ledger       = EXCLUDED.projected_at_ledger,
+		      synced_at                 = EXCLUDED.synced_at`,
+		pairIndex,
+		projectedRollover,
+		projectedFunding[0],
+		projectedFunding[1],
+		rollover.FeePerLedgerP,
+		funding.FeePerLedgerP,
+		atLedger,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `
+		INSERT INTO pair_oi (pair_index, long_oi, short_oi, updated_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (pair_index) DO UPDATE
+		  SET long_oi = EXCLUDED.long_oi,
+		      short_oi = EXCLUDED.short_oi,
+		      updated_at = EXCLUDED.updated_at`,
+		pairIndex, oi.Long, oi.Short,
+	)
+	return err
+}
+
+func parseFundingPair(raw []byte) ([2]string, error) {
+	var out [2]string
+	var tuple []string
+	if err := json.Unmarshal(raw, &tuple); err == nil && len(tuple) >= 2 {
+		out[0], out[1] = tuple[0], tuple[1]
+		return out, nil
+	}
+
+	var anyTuple []any
+	if err := json.Unmarshal(raw, &anyTuple); err != nil {
+		return out, err
+	}
+	if len(anyTuple) < 2 {
+		return out, fmt.Errorf("expected 2 tuple values, got %d", len(anyTuple))
+	}
+	out[0] = fmt.Sprint(anyTuple[0])
+	out[1] = fmt.Sprint(anyTuple[1])
+	return out, nil
 }

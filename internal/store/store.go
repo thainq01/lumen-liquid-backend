@@ -88,6 +88,10 @@ func (r *Repo) Apply(ctx context.Context, e events.Event, eventIndex uint32) err
 		if err := applyVault(ctx, tx, e, occurred); err != nil {
 			return err
 		}
+	case events.SrcRegistry:
+		if err := applyRegistry(ctx, tx, e, occurred); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit(ctx)
@@ -324,6 +328,65 @@ func applyVault(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) er
 			      total_withdrawn = vault_positions.total_withdrawn + EXCLUDED.total_withdrawn,
 			      last_action_at  = EXCLUDED.last_action_at`,
 			e.Trader, bigStr(e.Shares), bigStr(e.Assets), at)
+		return err
+	}
+	return nil
+}
+
+// ── Registry projections ──────────────────────────────────────────────────
+
+func applyRegistry(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) error {
+	switch e.Topic {
+	case "rollover_rate":
+		if e.PairIndex == nil || e.RatePer == nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO pair_fee_accumulators (
+			  pair_index, rollover_fee_per_ledger_p, synced_at
+			) VALUES ($1, $2, $3)
+			ON CONFLICT (pair_index) DO UPDATE
+			  SET rollover_fee_per_ledger_p = EXCLUDED.rollover_fee_per_ledger_p,
+			      synced_at = EXCLUDED.synced_at`,
+			*e.PairIndex, bigStr(e.RatePer), at)
+		return err
+	case "funding_rate":
+		if e.PairIndex == nil || e.RatePer == nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO pair_fee_accumulators (
+			  pair_index, funding_fee_per_ledger_p, synced_at
+			) VALUES ($1, $2, $3)
+			ON CONFLICT (pair_index) DO UPDATE
+			  SET funding_fee_per_ledger_p = EXCLUDED.funding_fee_per_ledger_p,
+			      synced_at = EXCLUDED.synced_at`,
+			*e.PairIndex, bigStr(e.RatePer), at)
+		return err
+	case "oi_add", "oi_sub":
+		if e.PairIndex == nil || e.OIIsLong == nil || e.Amount == nil {
+			return nil
+		}
+		longDelta, shortDelta := "0", "0"
+		if *e.OIIsLong {
+			longDelta = bigStr(e.Amount)
+		} else {
+			shortDelta = bigStr(e.Amount)
+		}
+		sign := "+"
+		insertLong, insertShort := longDelta, shortDelta
+		if e.Topic == "oi_sub" {
+			sign = "-"
+			insertLong, insertShort = "0", "0"
+		}
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			INSERT INTO pair_oi (pair_index, long_oi, short_oi, updated_at)
+			VALUES ($1, GREATEST(0, $2::NUMERIC), GREATEST(0, $3::NUMERIC), $4)
+			ON CONFLICT (pair_index) DO UPDATE
+			  SET long_oi = GREATEST(0, pair_oi.long_oi %s $5::NUMERIC),
+			      short_oi = GREATEST(0, pair_oi.short_oi %s $6::NUMERIC),
+			      updated_at = EXCLUDED.updated_at`, sign, sign),
+			*e.PairIndex, insertLong, insertShort, at, longDelta, shortDelta)
 		return err
 	}
 	return nil

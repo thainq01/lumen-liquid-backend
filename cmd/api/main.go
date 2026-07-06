@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/lumenliquid/backend/internal/config"
 	"github.com/lumenliquid/backend/internal/db"
+	"github.com/lumenliquid/backend/internal/keeper"
 	"github.com/lumenliquid/backend/internal/log"
 	"github.com/lumenliquid/backend/internal/pubsub"
 	"github.com/lumenliquid/backend/internal/wsgateway"
@@ -308,10 +310,15 @@ func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 		trader := chi.URLParam(r, "trader")
 
 		rows, err := pool.Query(r.Context(), `
-			SELECT trader, pair_index, trade_index, is_long, leverage,
-				   collateral, open_price, acc_rollover_open, acc_funding_open,
-				   tp_price, sl_price, liq_price, opened_at
-			FROM trades WHERE trader = $1
+			SELECT t.trader, t.pair_index, t.trade_index, t.is_long, t.leverage,
+				   t.collateral, t.open_price, t.acc_rollover_open, t.acc_funding_open,
+				   t.tp_price, t.sl_price, t.liq_price, COALESCE(p.liq_threshold_p, t.liq_threshold_p),
+				   a.acc_rollover, a.acc_funding_long, a.acc_funding_short,
+				   t.opened_at
+			FROM trades t
+			LEFT JOIN pairs p ON p.pair_index = t.pair_index
+			LEFT JOIN pair_fee_accumulators a ON a.pair_index = t.pair_index
+			WHERE t.trader = $1
 			ORDER BY pair_index, trade_index`,
 			trader,
 		)
@@ -325,16 +332,20 @@ func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 		for rows.Next() {
 			var t map[string]any = make(map[string]any)
 			var isLong bool
-			var lev int
+			var lev uint32
 			var pairIdx, tradeIdx int
 			var collateral, openPrice, accRolloverOpen, accFundingOpen string
 			var tpPrice, slPrice, liqPrice string
+			var liqThresholdP uint32
+			var accRolloverNow, accFundingLongNow, accFundingShortNow *string
 			var openedAt time.Time
 			var traderAddr string
 
 			if err := rows.Scan(&traderAddr, &pairIdx, &tradeIdx, &isLong, &lev,
 				&collateral, &openPrice, &accRolloverOpen, &accFundingOpen,
-				&tpPrice, &slPrice, &liqPrice, &openedAt); err != nil {
+				&tpPrice, &slPrice, &liqPrice, &liqThresholdP,
+				&accRolloverNow, &accFundingLongNow, &accFundingShortNow,
+				&openedAt); err != nil {
 				continue
 			}
 
@@ -350,20 +361,33 @@ func handleGetTrades(pool *pgxpool.Pool) http.HandlerFunc {
 			t["tp_price"] = tpPrice
 			t["sl_price"] = slPrice
 			t["liq_price"] = liqPrice
+			t["current_liq_price"] = liqPrice
+			t["rollover_fee"] = "0"
+			t["funding_fee"] = "0"
+			if accRolloverNow != nil && accFundingLongNow != nil && accFundingShortNow != nil {
+				accFundingNow := *accFundingShortNow
+				if isLong {
+					accFundingNow = *accFundingLongNow
+				}
+				rolloverFee, fundingFee, currentLiq := calculateTradeTimeFeesAndLiq(
+					openPrice, collateral, accRolloverOpen, accFundingOpen,
+					*accRolloverNow, accFundingNow, isLong, lev, liqThresholdP,
+				)
+				if rolloverFee != nil {
+					t["rollover_fee"] = rolloverFee.String()
+				}
+				if fundingFee != nil {
+					t["funding_fee"] = fundingFee.String()
+				}
+				if currentLiq != nil {
+					t["current_liq_price"] = currentLiq.String()
+				}
+			}
 			t["opened_at"] = openedAt
 			trades = append(trades, t)
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"trader":"%s","trades":`, trader)
-		if len(trades) == 0 {
-			w.Write([]byte("[]"))
-		} else {
-			// Simple JSON encoding
-			data, _ := jsonMarshalTrades(trades)
-			w.Write(data)
-		}
-		w.Write([]byte("}"))
+		writeJSON(w, map[string]any{"trader": trader, "trades": trades})
 	}
 }
 
@@ -537,6 +561,48 @@ func writeJSON(w http.ResponseWriter, payload any) {
 func mustParseRFC3339(s string) time.Time {
 	t, _ := time.Parse(time.RFC3339, s)
 	return t
+}
+
+func calculateTradeTimeFeesAndLiq(
+	openPrice, collateral, accRolloverOpen, accFundingOpen string,
+	accRolloverNow, accFundingNow string,
+	isLong bool,
+	leverage uint32,
+	liqThresholdP uint32,
+) (*big.Int, *big.Int, *big.Int) {
+	open := parseBig(openPrice)
+	collat := parseBig(collateral)
+	rollOpen := parseBig(accRolloverOpen)
+	fundingOpen := parseBig(accFundingOpen)
+	rollNow := parseBig(accRolloverNow)
+	fundingNow := parseBig(accFundingNow)
+	if open == nil || collat == nil || rollOpen == nil || fundingOpen == nil || rollNow == nil || fundingNow == nil {
+		return nil, nil, nil
+	}
+	rolloverFee, err := keeper.RolloverFeeForTrade(rollOpen, rollNow, collat)
+	if err != nil {
+		return nil, nil, nil
+	}
+	fundingFee, err := keeper.FundingFeeForTrade(fundingOpen, fundingNow, collat, leverage)
+	if err != nil {
+		return rolloverFee, nil, nil
+	}
+	if liqThresholdP == 0 {
+		liqThresholdP = 90
+	}
+	liq, err := keeper.LiquidationPrice(open, isLong, collat, leverage, rolloverFee, fundingFee, liqThresholdP)
+	if err != nil {
+		return rolloverFee, fundingFee, nil
+	}
+	return rolloverFee, fundingFee, liq
+}
+
+func parseBig(s string) *big.Int {
+	v, ok := new(big.Int).SetString(s, 10)
+	if !ok {
+		return nil
+	}
+	return v
 }
 
 func handleTradeWebSocket(hub *wsgateway.Hub, logger zerolog.Logger) http.HandlerFunc {

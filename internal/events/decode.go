@@ -70,6 +70,7 @@ type Event struct {
 	TradeIndex *int32 `json:"trade_index,omitempty"`
 	LimitIndex *int32 `json:"limit_index,omitempty"`
 	GroupIndex *int32 `json:"group_index,omitempty"`
+	OIIsLong   *bool  `json:"oi_is_long,omitempty"`
 
 	// Decoded payload (typed for known topics, raw for unknown).
 	Trade       *Trade      `json:"trade,omitempty"`
@@ -141,6 +142,8 @@ var registryTopics = map[string]bool{
 	"open_fee":      true,
 	"close_fee":     true,
 	"max_pos":       true,
+	"oi_add":        true,
+	"oi_sub":        true,
 }
 
 // Decode converts an RPC EventResult into a typed Event. `pmID`, `vaultID`,
@@ -366,7 +369,14 @@ func decodeRegistry(e *Event, topic string, topics []any, data any) {
 				e.PairIndex = ptrI32(i)
 			case "group_added", "group_updated", "open_fee", "close_fee":
 				e.GroupIndex = ptrI32(i)
+			case "oi_add", "oi_sub":
+				e.PairIndex = ptrI32(i)
 			}
+		}
+	}
+	if (topic == "oi_add" || topic == "oi_sub") && len(topics) > 2 {
+		if b, ok := topics[2].(bool); ok {
+			e.OIIsLong = &b
 		}
 	}
 	switch topic {
@@ -383,6 +393,8 @@ func decodeRegistry(e *Event, topic string, topics []any, data any) {
 	case "open_fee", "close_fee":
 		e.FeePer = toBig(data)
 	case "depth", "max_pos":
+		e.Amount = toBig(data)
+	case "oi_add", "oi_sub":
 		e.Amount = toBig(data)
 	}
 }

@@ -25,7 +25,13 @@ func Detect(pairIndex int, price *big.Int, state *TradeState) []PendingAction {
 	var actions []PendingAction
 
 	for _, t := range trades {
-		if IsLiquidatable(price, t.LiqPrice, t.IsLong) {
+		liqPrice := t.LiqPrice
+		if fee := state.FeeState(pairIndex); fee != nil {
+			if current, err := currentLiquidationPrice(t, fee); err == nil {
+				liqPrice = current
+			}
+		}
+		if IsLiquidatable(price, liqPrice, t.IsLong) {
 			actions = append(actions, PendingAction{
 				Type:   ActionLiquidate,
 				Key:    t.Key,
@@ -54,6 +60,34 @@ func Detect(pairIndex int, price *big.Int, state *TradeState) []PendingAction {
 		}
 	}
 	return actions
+}
+
+func currentLiquidationPrice(t TradeEntry, fee *PairFeeState) (*big.Int, error) {
+	accFundingNow := fee.AccFundingShort
+	if t.IsLong {
+		accFundingNow = fee.AccFundingLong
+	}
+	rolloverFee, err := RolloverFeeForTrade(t.AccRolloverOpen, fee.AccRollover, t.Collateral)
+	if err != nil {
+		return nil, err
+	}
+	fundingFee, err := FundingFeeForTrade(t.AccFundingOpen, accFundingNow, t.Collateral, t.Leverage)
+	if err != nil {
+		return nil, err
+	}
+	liqThresholdP := t.LiqThresholdP
+	if liqThresholdP == 0 {
+		liqThresholdP = 90
+	}
+	return LiquidationPrice(
+		t.OpenPrice,
+		t.IsLong,
+		t.Collateral,
+		t.Leverage,
+		rolloverFee,
+		fundingFee,
+		liqThresholdP,
+	)
 }
 
 // checkLimit mirrors the contract gate in execute_limit_order: a long fills

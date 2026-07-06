@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/lumenliquid/backend/internal/config"
 	"github.com/lumenliquid/backend/internal/db"
@@ -66,6 +67,20 @@ func main() {
 		logger.Fatal().Err(err).Msg("load trades")
 	}
 	go state.SubscribeRedis(ctx, rdb, logger)
+	go func() {
+		tick := time.NewTicker(cfg.KeeperPollInterval)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				if err := state.LoadFeeAccumulatorsFromDB(ctx, pool); err != nil {
+					logger.Warn().Err(err).Msg("refresh pair fee accumulators")
+				}
+			}
+		}
+	}()
 
 	// Tx builder: needs the keeper account's current sequence number.
 	keeperKP, err := keeperAddress(cfg.KeeperSecret)

@@ -21,9 +21,111 @@ var (
 )
 
 var (
-	hundred = big.NewInt(100)
-	zero    = big.NewInt(0)
+	hundred   = big.NewInt(100)
+	zero      = big.NewInt(0)
+	pScale    = big.NewInt(10_000_000_000)
+	usdcScale = big.NewInt(10_000_000)
 )
+
+// PendingAccRollover mirrors crates/math/src/fees.rs::pending_acc_rollover.
+func PendingAccRollover(accPerCollateral *big.Int, deltaLedgers uint64, rolloverFeePerLedgerP *big.Int) (*big.Int, error) {
+	if accPerCollateral == nil {
+		accPerCollateral = zero
+	}
+	if deltaLedgers == 0 || rolloverFeePerLedgerP == nil || rolloverFeePerLedgerP.Sign() == 0 {
+		return new(big.Int).Set(accPerCollateral), nil
+	}
+	denom := new(big.Int).Mul(pScale, hundred)
+	num := new(big.Int).Mul(rolloverFeePerLedgerP, usdcScale)
+	inc := new(big.Int).Mul(big.NewInt(int64(deltaLedgers)), num)
+	inc.Quo(inc, denom)
+	return new(big.Int).Add(accPerCollateral, inc), nil
+}
+
+// PendingAccFunding mirrors crates/math/src/fees.rs::pending_acc_funding.
+func PendingAccFunding(
+	accLong, accShort, oiLong, oiShort *big.Int,
+	deltaLedgers uint64,
+	fundingFeePerLedgerP *big.Int,
+) (*big.Int, *big.Int, error) {
+	if accLong == nil {
+		accLong = zero
+	}
+	if accShort == nil {
+		accShort = zero
+	}
+	if oiLong == nil {
+		oiLong = zero
+	}
+	if oiShort == nil {
+		oiShort = zero
+	}
+	if deltaLedgers == 0 || fundingFeePerLedgerP == nil || fundingFeePerLedgerP.Sign() == 0 {
+		return new(big.Int).Set(accLong), new(big.Int).Set(accShort), nil
+	}
+
+	oiDiff := new(big.Int).Sub(oiLong, oiShort)
+	stage := new(big.Int).Mul(oiDiff, big.NewInt(int64(deltaLedgers)))
+	denom := new(big.Int).Mul(pScale, hundred)
+	paidByLongs := new(big.Int).Mul(stage, fundingFeePerLedgerP)
+	paidByLongs.Quo(paidByLongs, denom)
+
+	newLong := new(big.Int).Set(accLong)
+	if oiLong.Sign() > 0 {
+		inc := new(big.Int).Mul(paidByLongs, usdcScale)
+		inc.Quo(inc, oiLong)
+		newLong.Add(newLong, inc)
+	}
+
+	newShort := new(big.Int).Set(accShort)
+	if oiShort.Sign() > 0 {
+		inc := new(big.Int).Mul(paidByLongs, usdcScale)
+		inc.Quo(inc, oiShort)
+		newShort.Sub(newShort, inc)
+	}
+	return newLong, newShort, nil
+}
+
+// RolloverFeeForTrade mirrors crates/math/src/fees.rs::rollover_fee_for_trade.
+func RolloverFeeForTrade(accOpen, accNow, collateral *big.Int) (*big.Int, error) {
+	if accOpen == nil {
+		accOpen = zero
+	}
+	if accNow == nil {
+		accNow = zero
+	}
+	if collateral == nil {
+		return nil, ErrInvalid
+	}
+	delta := new(big.Int).Sub(accNow, accOpen)
+	if delta.Sign() == 0 {
+		return big.NewInt(0), nil
+	}
+	fee := new(big.Int).Mul(delta, collateral)
+	fee.Quo(fee, usdcScale)
+	return fee, nil
+}
+
+// FundingFeeForTrade mirrors crates/math/src/fees.rs::funding_fee_for_trade.
+func FundingFeeForTrade(accOpen, accNow, collateral *big.Int, leverage uint32) (*big.Int, error) {
+	if accOpen == nil {
+		accOpen = zero
+	}
+	if accNow == nil {
+		accNow = zero
+	}
+	if collateral == nil {
+		return nil, ErrInvalid
+	}
+	delta := new(big.Int).Sub(accNow, accOpen)
+	if delta.Sign() == 0 {
+		return big.NewInt(0), nil
+	}
+	staged := new(big.Int).Mul(delta, collateral)
+	staged.Quo(staged, usdcScale)
+	staged.Mul(staged, big.NewInt(int64(leverage)))
+	return staged, nil
+}
 
 // LiquidationPrice mirrors crates/math/src/liq.rs::liquidation_price.
 //
