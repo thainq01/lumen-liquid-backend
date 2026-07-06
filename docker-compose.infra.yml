@@ -9,7 +9,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "lumen"]
+      test: ["CMD", "pg_isready", "-U", "lumen", "-d", "lumenliquid"]
       interval: 5s
       timeout: 3s
       retries: 5

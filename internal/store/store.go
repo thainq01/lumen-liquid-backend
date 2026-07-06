@@ -322,9 +322,9 @@ func applyVault(ctx context.Context, tx pgx.Tx, e events.Event, at time.Time) er
 	case "withdraw":
 		_, err := tx.Exec(ctx, `
 			INSERT INTO vault_positions (depositor, shares, total_withdrawn, last_action_at)
-			VALUES ($1, -$2, $3, $4)
+			VALUES ($1, -($2::numeric), $3, $4)
 			ON CONFLICT (depositor) DO UPDATE
-			  SET shares          = vault_positions.shares - EXCLUDED.shares * -1,
+			  SET shares          = vault_positions.shares + EXCLUDED.shares,
 			      total_withdrawn = vault_positions.total_withdrawn + EXCLUDED.total_withdrawn,
 			      last_action_at  = EXCLUDED.last_action_at`,
 			e.Trader, bigStr(e.Shares), bigStr(e.Assets), at)
