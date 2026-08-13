@@ -99,7 +99,8 @@ func main() {
 	}
 }
 
-func collectContractIDs(cfg *config.Config) []string {	var ids []string
+func collectContractIDs(cfg *config.Config) []string {
+	var ids []string
 	for _, id := range []string{cfg.PMContractID, cfg.VaultContractID, cfg.RegistryContractID} {
 		id = strings.TrimSpace(id)
 		if id != "" {
@@ -254,40 +255,46 @@ func logEvent(logger zerolog.Logger, e events.Event) {
 
 	switch e.Topic {
 	case "opened":
-		logger.Info().
+		entry := logger.Info().
 			Str("tx", e.TxHash).
-			Str("trader", e.Trader).
-			Int("pair", int(e.Trade.PairIndex)).
-			Int("trade_idx", int(*e.TradeIndex)).
-			Bool("long", e.Trade.IsLong).
-			Int("lev", int(e.Trade.Leverage)).
-			Str("collateral", e.Trade.Collateral.String()).
-			Int64("lag_ms", lagMs).
-			Msg("trade opened")
+			Str("trader", e.Trader)
+		if e.TradeIndex != nil {
+			entry.Int("trade_idx", int(*e.TradeIndex))
+		}
+		if e.Trade != nil {
+			entry.
+				Int("pair", int(e.Trade.PairIndex)).
+				Bool("long", e.Trade.IsLong).
+				Int("lev", int(e.Trade.Leverage))
+			if e.Trade.Collateral != nil {
+				entry.Str("collateral", e.Trade.Collateral.String())
+			}
+		}
+		entry.Int64("lag_ms", lagMs).Msg("trade opened")
 	case "closed":
-		logger.Info().
+		entry := logger.Info().
 			Str("tx", e.TxHash).
-			Str("trader", e.Trader).
-			Int("trade_idx", int(*e.TradeIndex)).
-			Str("reason", "manual").
-			Int64("lag_ms", lagMs).
-			Msg("trade closed")
+			Str("trader", e.Trader)
+		if e.TradeIndex != nil {
+			entry.Int("trade_idx", int(*e.TradeIndex))
+		}
+		entry.Str("reason", "manual").Int64("lag_ms", lagMs).Msg("trade closed")
 	case "tp_sl_executed":
-		logger.Info().
+		entry := logger.Info().
 			Str("tx", e.TxHash).
-			Str("trader", e.Trader).
-			Int("trade_idx", int(*e.TradeIndex)).
-			Str("reason", "tp/sl").
-			Int64("lag_ms", lagMs).
-			Msg("trade closed")
+			Str("trader", e.Trader)
+		if e.TradeIndex != nil {
+			entry.Int("trade_idx", int(*e.TradeIndex))
+		}
+		entry.Str("reason", "tp/sl").Int64("lag_ms", lagMs).Msg("trade closed")
 	case "liq":
-		logger.Info().
+		entry := logger.Info().
 			Str("tx", e.TxHash).
-			Str("trader", e.Trader).
-			Int("trade_idx", int(*e.TradeIndex)).
-			Str("reason", "liquidation").
-			Int64("lag_ms", lagMs).
-			Msg("trade closed")
+			Str("trader", e.Trader)
+		if e.TradeIndex != nil {
+			entry.Int("trade_idx", int(*e.TradeIndex))
+		}
+		entry.Str("reason", "liquidation").Int64("lag_ms", lagMs).Msg("trade closed")
 	}
 }
 

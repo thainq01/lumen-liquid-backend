@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/rs/zerolog"
+
+	"github.com/lumenliquid/backend/internal/events"
+)
 
 func TestLedgerFromCursor(t *testing.T) {
 	tests := []struct {
@@ -43,6 +49,16 @@ func TestLedgerFromCursor(t *testing.T) {
 			if ok && got != tt.wantLedge {
 				t.Errorf("ledger = %d, want %d", got, tt.wantLedge)
 			}
+		})
+	}
+}
+
+func TestLogEventToleratesIncompleteLegacyEvents(t *testing.T) {
+	logger := zerolog.Nop()
+
+	for _, topic := range []string{"opened", "closed", "tp_sl_executed", "liq"} {
+		t.Run(topic, func(t *testing.T) {
+			logEvent(logger, events.Event{Topic: topic})
 		})
 	}
 }
